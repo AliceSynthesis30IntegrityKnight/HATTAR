@@ -164,7 +164,107 @@ local function jit_build()
   return true
 end
 
+-- event-driven ("asynchronous") engine: only re-evaluate gates whose
+-- inputs actually changed since the previous tick, instead of a full
+-- unconditional sweep of every node every tick. Same NAND semantics,
+-- same tick-prior -> tick-next timing; just skips settled subgraphs.
+local ASYNC = os.getenv("HATTAR_ASYNC") == "1"
+local FANOUT = nil
+local active_set = nil
+
+local function build_fanout()
+  local fo = {}
+  for i = 1, nn do fo[i] = {} end
+  for i = 1, nn do
+    local Ei = E[i]
+    for j = 1, #Ei do
+      local src = Ei[j]
+      fo[src][#fo[src] + 1] = i
+    end
+  end
+  return fo
+end
+
+local function eval_node(i)
+  local v, Ei = 1, E[i]
+  for j = 1, #Ei do v = v & S[Ei[j]] end
+  local x = (#Ei > 0) and (1 - v) or 0
+  if pend[i] then x = 1; pend[i] = false
+  elseif hold[i] >= 0 then x = hold[i] end
+  return x
+end
+
+local total_evals = 0
+
+local function tick_async_one()
+  local active = active_set
+  local nextactive = {}
+  local changedn = 0
+  local n_active = 0
+  -- evaluate active nodes
+  for i in pairs(active) do
+    n_active = n_active + 1
+    local was_pend = pend[i]
+    X[i] = eval_node(i)
+    if was_pend then nextactive[i] = true end   -- pulse just consumed: re-check next tick
+  end
+  total_evals = total_evals + n_active
+  -- hook overrides (bounded cost, independent of gate count)
+  for k = 1, #keyb do
+    local nd = keyb[k].node
+    X[nd] = KV[k]
+    active[nd] = true          -- ensure hook nodes are always considered
+  end
+  local ad
+  if #maddr > 0 then
+    ad = 0
+    for i = 1, #maddr do ad = ad | (S[maddr[i]] << (i - 1)) end
+    ad = ad & (MEMSZ - 1)
+    if mwe and S[mwe] == 1 then
+      local d = 0
+      for i = 1, #mdin do d = d | (S[mdin[i]] << (i - 1)) end
+      MEM[ad] = d & 0xFF
+    end
+    local q = MEM[ad]
+    for i = 1, #mdout do
+      X[mdout[i]] = (q >> (i - 1)) & 1
+      active[mdout[i]] = true
+    end
+  end
+  -- commit + propagate: for every node we touched this tick, if its value
+  -- changed, wake up everything that reads it next tick.
+  for i in pairs(active) do
+    local x = X[i]
+    if x ~= S[i] then
+      changedn = changedn + 1
+      local fo = FANOUT[i]
+      for f = 1, #fo do nextactive[fo[f]] = true end
+    end
+    S[i] = x
+  end
+  for w = 1, #watch do HIST[(hp % HRING) * NWMAX + w] = S[watch[w]] end
+  hp = hp + 1
+  active_set = nextactive
+  return changedn
+end
+
+local function ticks_async(k)
+  if not FANOUT then FANOUT = build_fanout() end
+  if not active_set then
+    active_set = {}
+    for i = 1, nn do active_set[i] = true end   -- first call: settle everything once
+  end
+  for _ = 1, k do
+    if anypend then
+      for i = 1, nn do if pend[i] then active_set[i] = true end end
+      anypend = false
+    end
+    tick_async_one()
+  end
+end
+
 local function ticks(k)
+  if ASYNC then ticks_async(k); return end
   if k <= 0 then return end
   while anypend and k > 0 do tick_one_interp(); k = k - 1 end
   if k == 0 then return end
@@ -280,6 +380,7 @@ local function load_line(line)
     elseif v == "1" then hold[i] = 1; dirty = true
     elseif v == "0" then hold[i] = 0; dirty = true
     else hold[i] = -1; dirty = true end
+    if ASYNC and active_set then active_set[i] = true end
   elseif tk[2] == ":" then                              -- declare
     local i, mode, srcs, sawsrc = id(t), 0, {}, false
     for k = 3, #tk do
@@ -350,6 +451,62 @@ local function headless(n, pbm)
   for p = 1, #pixb do if S[pixb[p].node] == 1 then lit = lit + 1 end end
   io.write(("  pixels lit: %d / %d\n"):format(lit, #pixb))
   if pbm then dump_pbm(pbm) end
+  if ASYNC and hp > 0 then
+    io.write(("  [async] avg active nodes/tick (measured delta) = %.1f  (N=%d, N/delta=%.1fx)\n")
+             :format(total_evals / hp, nn, nn / (total_evals / hp)))
+  end
+
+  -- extra debug: dump PC and register file as integers, if present
+  local function bits_to_int(prefix, n)
+    local v = 0
+    for b = 0, n - 1 do
+      local i = IDX[prefix .. b]
+      if i and S[i] == 1 then v = v | (1 << b) end
+    end
+    return v
+  end
+  local pcidx = IDX["pc0"]
+  if pcidx then
+    io.write(("  PC = 0x%08x\n"):format(bits_to_int("pc", 32)))
+  end
+  local any_x = false
+  for r = 1, 31 do
+    if IDX["x" .. r .. "_0"] then any_x = true; break end
+  end
+  if any_x then
+    io.write("  registers:\n")
+    for r = 1, 31 do
+      local v = bits_to_int("x" .. r .. "_", 32)
+      io.write(("    x%-2d = 0x%08x (%d)%s"):format(r, v, v, (r % 4 == 0) and "\n" or "   "))
+    end
+    io.write("\n")
+  end
+end
+
+function _G.hattar_dump_mem_nz(lo, hi)
+  local a = lo
+  while a <= hi do
+    if MEM[a] ~= 0 then
+      local row = a - (a % 16)
+      io.write(("  %04x:"):format(row))
+      for k = 0, 15 do io.write((" %02x"):format(MEM[(row + k) & (MEMSZ - 1)])) end
+      io.write("\n")
+      a = row + 16
+    else
+      a = a + 1
+    end
+  end
+end
+
+-- dump an arbitrary memory range (byte-addressed) as hex, exposed for debug
+function _G.hattar_dump_mem(lo, hi)
+  for a = lo, hi, 16 do
+    io.write(("  %04x:"):format(a))
+    for k = 0, 15 do
+      if a + k <= hi then io.write((" %02x"):format(MEM[(a + k) & (MEMSZ - 1)])) end
+    end
+    io.write("\n")
+  end
 end
 
 -- LÖVE window mode (used automatically when run under love2d) -----------------
@@ -438,7 +595,7 @@ else
                     .. "       (window mode: run under love2d)\n")
     os.exit(1)
   end
-  local headn, presses, pbm = nil, {}, nil
+  local headn, presses, pbm, dumprange, trace_n = nil, {}, nil, nil, nil
   local i = 2
   while arg[i] do
     if arg[i] == "--headless" and arg[i + 1] then
@@ -447,10 +604,29 @@ else
       presses[#presses + 1] = arg[i + 1]; i = i + 1
     elseif arg[i] == "--pbm" and arg[i + 1] then
       pbm = arg[i + 1]; i = i + 1
+    elseif arg[i] == "--dump" and arg[i + 1] then
+      dumprange = arg[i + 1]; i = i + 1
+    elseif arg[i] == "--trace" and arg[i + 1] then
+      trace_n = tonumber(arg[i + 1]); i = i + 1
     end
     i = i + 1
   end
   load_file(machine)
+  if trace_n then
+    local names = {}
+    for i = 1, nn do names[i] = i end
+    table.sort(names, function(a, b) return NM[a] < NM[b] end)
+    local f = assert(io.open("/tmp/trace_async.txt", "w"))
+    for step = 1, trace_n do
+      ticks(1)
+      local parts = {}
+      for k = 1, nn do parts[k] = S[names[k]] end
+      f:write(table.concat(parts), "\n")
+    end
+    f:close()
+    io.write(("wrote /tmp/trace_async.txt (%d ticks x %d nodes)\n"):format(trace_n, nn))
+    os.exit(0)
+  end
   for _, name in ipairs(presses) do             -- applies after load-time 't'
     local found = false
     for k = 1, #keyb do
@@ -460,7 +636,18 @@ else
       io.stderr:write(("--press: no key '%s' bound\n"):format(name))
     end
   end
-  if headn then headless(headn, pbm)
+  if headn then
+    headless(headn, pbm)
+    if dumprange then
+      local lo, hi = dumprange:match("^(%x+)[,:](%x+)$")
+      if lo then _G.hattar_dump_mem(tonumber(lo, 16), tonumber(hi, 16)) end
+    end
+    for _, a in ipairs(arg) do
+      if a == "--dumpnz" then
+        io.write("  nonzero bytes at/after 0x0100:\n")
+        _G.hattar_dump_mem_nz(0x0100, 0xFFFF)
+      end
+    end
   else
     io.stderr:write("no --headless N given and not running under love2d;"
                     .. " nothing to do.\n")
