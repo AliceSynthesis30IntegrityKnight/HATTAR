@@ -1,0 +1,232 @@
+# Sierpinski triangle, computed by NAND gates, drawn into VRAM
+hz 1000000
+vram 0 128 128 4
+
+# ---- 12-bit Galois LFSR, x^12+x^6+x^4+x+1, dual-rail, master-slave ----
+# s0..s11 true rail, c0..c11 complement rail; one LFSR step per 2 ticks.
+# Bit 0: fed from the feedback bit s11 (double inversion = clean copy).
+m0 : T- s11
+s0 : T- m0
+n0 : T- c11
+c0 : T- n0
+# Bit 1: tap. s1 <- XOR(s0, s11), c1 <- XNOR (its complement).
+p1 : T- s0 c11
+q1 : T- c0 s11
+s1 : T- p1 q1
+u1 : T- s0 s11
+v1 : T- c0 c11
+c1 : T- u1 v1
+# Bits 2..3: plain shift, both rails.
+m2 : T- s1
+s2 : T- m2
+n2 : T- c1
+c2 : T- n2
+m3 : T- s2
+s3 : T- m3
+n3 : T- c2
+c3 : T- n3
+# Bit 4: tap.
+p4 : T- s3 c11
+q4 : T- c3 s11
+s4 : T- p4 q4
+u4 : T- s3 s11
+v4 : T- c3 c11
+c4 : T- u4 v4
+# Bit 5: shift.
+m5 : T- s4
+s5 : T- m5
+n5 : T- c4
+c5 : T- n5
+# Bit 6: tap.
+p6 : T- s5 c11
+q6 : T- c5 s11
+s6 : T- p6 q6
+u6 : T- s5 s11
+v6 : T- c5 c11
+c6 : T- u6 v6
+# Bits 7..11: shift.
+m7 : T- s6
+s7 : T- m7
+n7 : T- c6
+c7 : T- n7
+m8 : T- s7
+s8 : T- m8
+n8 : T- c7
+c8 : T- n8
+m9 : T- s8
+s9 : T- m9
+n9 : T- c8
+c9 : T- n9
+m10 : T- s9
+s10 : T- m10
+n10 : T- c9
+c10 : T- n10
+m11 : T- s10
+s11 : T- m11
+n11 : T- c10
+c11 : T- n11
+
+# ---- 3-tick address delay, fed from the COMPLEMENT rail ----
+# The pixel logic below is depth 3, so maddr must see the state of 3
+# ticks ago. An odd chain inverts; starting from c_i, three inversions
+# yield the TRUE value: a_iz(t) = s_i(t-3). Address and data arrive at
+# the RAM computed from the very same LFSR state.
+a0x : T- c0
+a0y : T- a0x
+a0z : T- a0y
+a1x : T- c1
+a1y : T- a1x
+a1z : T- a1y
+a2x : T- c2
+a2y : T- a2x
+a2z : T- a2y
+a3x : T- c3
+a3y : T- a3x
+a3z : T- a3y
+a4x : T- c4
+a4y : T- a4x
+a4z : T- a4y
+a5x : T- c5
+a5y : T- a5x
+a5z : T- a5y
+a6x : T- c6
+a6y : T- a6x
+a6z : T- a6y
+a7x : T- c7
+a7y : T- a7x
+a7z : T- a7y
+a8x : T- c8
+a8y : T- a8x
+a8z : T- a8y
+a9x : T- c9
+a9y : T- a9x
+a9z : T- a9y
+a10x : T- c10
+a10y : T- a10x
+a10z : T- a10y
+maddr a0z a1z a2z a3z a4z a5z a6z a7z a8z a9z a10z
+
+# ---- pixel logic: din bit b = ((x & y) == 0) ----
+# addr[0:4] = byte column xB (= s0..s3), addr[4:11] = row y (= s4..s10).
+# Pixel x = xB*8 + b, so x's low 3 bits are the CONSTANT bits of b and
+# its high 4 bits are s0..s3. For each bit position j of x that is 1,
+# require NOT(y_j): single-input NAND of the y bit. For the xB bits,
+# require NOT(xB_j AND y_{3+j}): one two-input NAND each.
+# h_b = NAND(all terms), d_b = NOT h_b = AND(all terms). Depth 3.
+g0_0 : T- s0 s7
+g0_1 : T- s1 s8
+g0_2 : T- s2 s9
+g0_3 : T- s3 s10
+h0 : T- g0_0 g0_1 g0_2 g0_3
+d0 : T- h0
+g1_0 : T- s4
+g1_1 : T- s0 s7
+g1_2 : T- s1 s8
+g1_3 : T- s2 s9
+g1_4 : T- s3 s10
+h1 : T- g1_0 g1_1 g1_2 g1_3 g1_4
+d1 : T- h1
+g2_0 : T- s5
+g2_1 : T- s0 s7
+g2_2 : T- s1 s8
+g2_3 : T- s2 s9
+g2_4 : T- s3 s10
+h2 : T- g2_0 g2_1 g2_2 g2_3 g2_4
+d2 : T- h2
+g3_0 : T- s4
+g3_1 : T- s5
+g3_2 : T- s0 s7
+g3_3 : T- s1 s8
+g3_4 : T- s2 s9
+g3_5 : T- s3 s10
+h3 : T- g3_0 g3_1 g3_2 g3_3 g3_4 g3_5
+d3 : T- h3
+g4_0 : T- s6
+g4_1 : T- s0 s7
+g4_2 : T- s1 s8
+g4_3 : T- s2 s9
+g4_4 : T- s3 s10
+h4 : T- g4_0 g4_1 g4_2 g4_3 g4_4
+d4 : T- h4
+g5_0 : T- s4
+g5_1 : T- s6
+g5_2 : T- s0 s7
+g5_3 : T- s1 s8
+g5_4 : T- s2 s9
+g5_5 : T- s3 s10
+h5 : T- g5_0 g5_1 g5_2 g5_3 g5_4 g5_5
+d5 : T- h5
+g6_0 : T- s5
+g6_1 : T- s6
+g6_2 : T- s0 s7
+g6_3 : T- s1 s8
+g6_4 : T- s2 s9
+g6_5 : T- s3 s10
+h6 : T- g6_0 g6_1 g6_2 g6_3 g6_4 g6_5
+d6 : T- h6
+g7_0 : T- s4
+g7_1 : T- s5
+g7_2 : T- s6
+g7_3 : T- s0 s7
+g7_4 : T- s1 s8
+g7_5 : T- s2 s9
+g7_6 : T- s3 s10
+h7 : T- g7_0 g7_1 g7_2 g7_3 g7_4 g7_5 g7_6
+d7 : T- h7
+mdin d0 d1 d2 d3 d4 d5 d6 d7
+
+# ---- write every tick: both interleaved threads are valid ----
+we ! 1
+mwe we
+
+# ---- seed: pin both rails to state 000000000001, settle, release ----
+s0 ! 1
+c0 ! 0
+s1 ! 0
+c1 ! 1
+s2 ! 0
+c2 ! 1
+s3 ! 0
+c3 ! 1
+s4 ! 0
+c4 ! 1
+s5 ! 0
+c5 ! 1
+s6 ! 0
+c6 ! 1
+s7 ! 0
+c7 ! 1
+s8 ! 0
+c8 ! 1
+s9 ! 0
+c9 ! 1
+s10 ! 0
+c10 ! 1
+s11 ! 0
+c11 ! 1
+t 8
+s0 ! -
+c0 ! -
+s1 ! -
+c1 ! -
+s2 ! -
+c2 ! -
+s3 ! -
+c3 ! -
+s4 ! -
+c4 ! -
+s5 ! -
+c5 ! -
+s6 ! -
+c6 ! -
+s7 ! -
+c7 ! -
+s8 ! -
+c8 ! -
+s9 ! -
+c9 ! -
+s10 ! -
+c10 ! -
+s11 ! -
+c11 ! -
+w s0 s5 s11 we d0
