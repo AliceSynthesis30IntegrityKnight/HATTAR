@@ -170,7 +170,9 @@ end
 -- same tick-prior -> tick-next timing; just skips settled subgraphs.
 local ASYNC = os.getenv("HATTAR_ASYNC") == "1"
 local FANOUT = nil
-local active_set = nil
+local active_arr, active_cnt = nil, 0
+local next_arr, next_cnt = {}, 0
+local inNext = nil            -- boolean flag array, dedupes pushes into next_arr
 
 local function build_fanout()
   local fo = {}
@@ -196,28 +198,28 @@ end
 
 local total_evals = 0
 
+local function push_next(i)
+  if not inNext[i] then
+    inNext[i] = true
+    next_cnt = next_cnt + 1
+    next_arr[next_cnt] = i
+  end
+end
+
 local function tick_async_one()
-  local active = active_set
-  local nextactive = {}
-  local changedn = 0
-  local n_active = 0
-  -- evaluate active nodes
-  for i in pairs(active) do
-    n_active = n_active + 1
+  next_cnt = 0
+  -- evaluate all currently active nodes (plain array scan, no hash iteration)
+  for idx = 1, active_cnt do
+    local i = active_arr[idx]
     local was_pend = pend[i]
     X[i] = eval_node(i)
-    if was_pend then nextactive[i] = true end   -- pulse just consumed: re-check next tick
+    if was_pend then push_next(i) end   -- pulse just consumed: re-check next tick
   end
-  total_evals = total_evals + n_active
+  total_evals = total_evals + active_cnt
   -- hook overrides (bounded cost, independent of gate count)
-  for k = 1, #keyb do
-    local nd = keyb[k].node
-    X[nd] = KV[k]
-    active[nd] = true          -- ensure hook nodes are always considered
-  end
-  local ad
+  for k = 1, #keyb do X[keyb[k].node] = KV[k] end
   if #maddr > 0 then
-    ad = 0
+    local ad = 0
     for i = 1, #maddr do ad = ad | (S[maddr[i]] << (i - 1)) end
     ad = ad & (MEMSZ - 1)
     if mwe and S[mwe] == 1 then
@@ -226,37 +228,61 @@ local function tick_async_one()
       MEM[ad] = d & 0xFF
     end
     local q = MEM[ad]
-    for i = 1, #mdout do
-      X[mdout[i]] = (q >> (i - 1)) & 1
-      active[mdout[i]] = true
-    end
+    for i = 1, #mdout do X[mdout[i]] = (q >> (i - 1)) & 1 end
   end
-  -- commit + propagate: for every node we touched this tick, if its value
-  -- changed, wake up everything that reads it next tick.
-  for i in pairs(active) do
+  -- commit active nodes + propagate changes to fanout
+  for idx = 1, active_cnt do
+    local i = active_arr[idx]
     local x = X[i]
     if x ~= S[i] then
-      changedn = changedn + 1
       local fo = FANOUT[i]
-      for f = 1, #fo do nextactive[fo[f]] = true end
+      for f = 1, #fo do push_next(fo[f]) end
     end
     S[i] = x
   end
+  -- hook-driven nodes may not be in active_arr; commit+propagate them too
+  for k = 1, #keyb do
+    local nd = keyb[k].node
+    local x = X[nd]
+    if x ~= S[nd] then
+      local fo = FANOUT[nd]
+      for f = 1, #fo do push_next(fo[f]) end
+    end
+    S[nd] = x
+  end
+  for i = 1, #mdout do
+    local nd = mdout[i]
+    local x = X[nd]
+    if x ~= S[nd] then
+      local fo = FANOUT[nd]
+      for f = 1, #fo do push_next(fo[f]) end
+    end
+    S[nd] = x
+  end
   for w = 1, #watch do HIST[(hp % HRING) * NWMAX + w] = S[watch[w]] end
   hp = hp + 1
-  active_set = nextactive
-  return changedn
+  -- clear only the flags we set (bounded by next_cnt, not nn)
+  for idx = 1, next_cnt do inNext[next_arr[idx]] = false end
+  active_arr, next_arr = next_arr, active_arr
+  active_cnt = next_cnt
+end
+
+local function ensure_active(i)
+  for idx = 1, active_cnt do if active_arr[idx] == i then return end end
+  active_cnt = active_cnt + 1
+  active_arr[active_cnt] = i
 end
 
 local function ticks_async(k)
   if not FANOUT then FANOUT = build_fanout() end
-  if not active_set then
-    active_set = {}
-    for i = 1, nn do active_set[i] = true end   -- first call: settle everything once
+  if not active_arr then
+    active_arr, inNext = {}, {}
+    for i = 1, nn do active_arr[i] = i end
+    active_cnt = nn
   end
   for _ = 1, k do
     if anypend then
-      for i = 1, nn do if pend[i] then active_set[i] = true end end
+      for i = 1, nn do if pend[i] then ensure_active(i) end end
       anypend = false
     end
     tick_async_one()
@@ -380,7 +406,7 @@ local function load_line(line)
     elseif v == "1" then hold[i] = 1; dirty = true
     elseif v == "0" then hold[i] = 0; dirty = true
     else hold[i] = -1; dirty = true end
-    if ASYNC and active_set then active_set[i] = true end
+    if ASYNC and active_arr then ensure_active(i) end
   elseif tk[2] == ":" then                              -- declare
     local i, mode, srcs, sawsrc = id(t), 0, {}, false
     for k = 3, #tk do
