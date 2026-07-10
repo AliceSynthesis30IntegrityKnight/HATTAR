@@ -1,0 +1,995 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>HATTAR-PC — machine room</title>
+<style>
+  :root{
+    --ph-green:#49f07d; --ph-green-dim:#2b8f4e;
+    --ph-amber:#ffb648; --bezel:#231d15; --ink:#0b0d0b;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;background:#050605;overflow:hidden;
+    font-family:ui-monospace,Menlo,Consolas,"Cascadia Mono",monospace}
+  #game{position:fixed;inset:0;width:100vw;height:100vh;display:block;
+    image-rendering:pixelated;image-rendering:crisp-edges;cursor:crosshair}
+  .chip{position:fixed;z-index:5;background:#0c120d;color:var(--ph-green-dim);
+    border:1px solid #1d3a26;padding:6px 10px;font:11px/1 inherit;letter-spacing:.08em;
+    text-transform:lowercase;cursor:pointer}
+  .chip:hover,.chip:focus-visible{color:var(--ph-green);border-color:var(--ph-green-dim);outline:none}
+  #loadbtn{top:10px;right:10px}
+  /* machine loader */
+  #loader{position:fixed;inset:0;z-index:20;background:rgba(3,5,4,.88);
+    display:none;align-items:center;justify-content:center;padding:16px}
+  #loader.open{display:flex}
+  #loadpanel{width:min(720px,100%);background:#070b08;border:1px solid #1d3a26;
+    box-shadow:0 0 60px rgba(73,240,125,.08);padding:14px;display:flex;flex-direction:column;gap:10px}
+  #loadpanel h2{font:12px/1 inherit;color:var(--ph-green);letter-spacing:.15em;text-transform:lowercase}
+  #src{width:100%;height:min(52vh,420px);resize:vertical;background:#04170c;color:#bdf5cf;
+    border:1px solid #14301d;padding:10px;font:12px/1.5 inherit;white-space:pre;overflow:auto}
+  #src:focus-visible{outline:1px solid var(--ph-green-dim)}
+  .row{display:flex;gap:8px;justify-content:flex-end}
+  /* mobile terminal row + interact */
+  #mrow{position:fixed;left:0;right:0;bottom:0;z-index:15;display:none;gap:6px;
+    padding:8px;background:rgba(5,9,6,.92);border-top:1px solid #1d3a26}
+  #mrow.open{display:flex}
+  #mrow button{min-width:40px;background:#0c120d;color:var(--ph-green);border:1px solid #1d3a26;
+    font:14px/1 inherit;padding:8px 0}
+  #mline{flex:1;background:#04170c;border:1px solid #14301d;color:#bdf5cf;
+    font:13px/1.3 inherit;padding:8px}
+  #mact{position:fixed;right:14px;bottom:14px;z-index:15;display:none;
+    background:#0c120d;color:var(--ph-amber);border:1px solid #4a3410;
+    padding:12px 16px;font:13px/1 inherit}
+  #mact.open{display:block}
+  @media (prefers-reduced-motion: reduce){ *{scroll-behavior:auto} }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<button id="loadbtn" class="chip">load .hattar</button>
+
+<div id="loader" role="dialog" aria-label="load machine">
+  <div id="loadpanel">
+    <h2>machine file · paste .hattar source, boot resets the world</h2>
+    <textarea id="src" spellcheck="false" autocapitalize="off"></textarea>
+    <div class="row">
+      <button id="cancel" class="chip" style="position:static">cancel</button>
+      <button id="boot" class="chip" style="position:static">boot</button>
+    </div>
+  </div>
+</div>
+
+<div id="mrow">
+  <button data-pc="left" aria-label="machine left">◀</button>
+  <button data-pc="up" aria-label="machine up">▲</button>
+  <button data-pc="down" aria-label="machine down">▼</button>
+  <button data-pc="right" aria-label="machine right">▶</button>
+  <input id="mline" placeholder="hattar line…" autocapitalize="off" autocomplete="off" spellcheck="false">
+  <button id="mesc">esc</button>
+</div>
+<div id="mact">⏎ use</div>
+
+<script>
+"use strict";
+/* ==========================================================================
+   HATTAR-PC — machine room. JS port of hattar_pc.lua + raycast front-end.
+   The circuit core below mirrors the Lua file line-for-line where possible;
+   the Lua load() "JIT" becomes new Function().
+   ========================================================================== */
+
+const MAXE=16, MEMSZ=65536, NWMAX=16, HRING=4096, KEYMAX=32, BUSMAX=16;
+const FULL="\u2588", LOW="\u2581";
+
+/* circuit core ----------------------------------------------------------- */
+let NM, IDX, E, S, X, pend, hold, HOLDV;
+let nn, anypend, dirty, jit_dead, run_fn, jit_build_count;
+let MEM=new Uint8Array(MEMSZ);
+let maddr, mdin, mdout, mwe;
+let pixb, keyb, KV;
+let watch, HIST=new Uint8Array(HRING*NWMAX), hp;
+let scrW, scrH, scrS, vaddr, vW, vH, vS, hz, lineno;
+let paused=false, lastSrc="";
+
+function hardReset(){
+  NM=[""]; IDX=new Map(); E=[null];
+  S=[0]; X=[0]; pend=[false]; hold=[-1]; HOLDV=[0];
+  nn=0; anypend=false; dirty=true; jit_dead=false; run_fn=null; jit_build_count=0;
+  MEM.fill(0);
+  maddr=[]; mdin=[]; mdout=[]; mwe=0;
+  pixb=[]; keyb=[]; KV=[0];
+  watch=[]; HIST.fill(0); hp=0;
+  scrW=0; scrH=0; scrS=16; vaddr=-1; vW=0; vH=0; vS=4; hz=240; lineno=0;
+  paused=false;
+}
+
+function id(s){
+  let i=IDX.get(s); if(i) return i;
+  nn++; NM[nn]=s; IDX.set(s,nn); E[nn]=[];
+  S[nn]=0; X[nn]=0; pend[nn]=false; hold[nn]=-1; HOLDV[nn]=0;
+  dirty=true; return nn;
+}
+
+/* interpreter (fallback + reference) -------------------------------------- */
+function tick_one_interp(){
+  for(let i=1;i<=nn;i++){
+    const Ei=E[i]; let v=1;
+    for(let j=0;j<Ei.length;j++) v&=S[Ei[j]];
+    let x=Ei.length>0 ? 1-v : 0;              // empty AND=1, NAND -> 0
+    if(pend[i]){ x=1; pend[i]=false; }
+    else if(hold[i]>=0) x=hold[i];
+    X[i]=x;
+  }
+  anypend=false;
+  for(let k=0;k<keyb.length;k++) X[keyb[k].node]=KV[k+1];
+  if(maddr.length>0){
+    let ad=0;
+    for(let i=0;i<maddr.length;i++) ad|=S[maddr[i]]<<i;
+    ad&=MEMSZ-1;
+    if(mwe && S[mwe]===1){
+      let d=0;
+      for(let i=0;i<mdin.length;i++) d|=S[mdin[i]]<<i;
+      MEM[ad]=d&0xFF;
+    }
+    const q=MEM[ad];
+    for(let i=0;i<mdout.length;i++) X[mdout[i]]=(q>>i)&1;
+  }
+  for(let w=1;w<=watch.length;w++) HIST[(hp%HRING)*NWMAX+w]=X[watch[w-1]];
+  hp++;
+  for(let i=1;i<=nn;i++) S[i]=X[i];
+}
+
+/* "JIT": one flat JS function for gates + hooks, compiled with new Function */
+function jit_build(){
+  if(jit_dead) return false;
+  const t0=performance.now();
+  const L=[];
+  L.push("let a=S,b=X;");
+  L.push("for(let t=0;t<k;t++){");
+  for(let i=1;i<=nn;i++){
+    if(hold[i]>=0) L.push("b["+i+"]=HOLDV["+i+"];");
+    else if(E[i].length===0) L.push("b["+i+"]=0;");
+    else L.push("b["+i+"]=1-("+E[i].map(j=>"a["+j+"]").join("&")+");");
+  }
+  for(let k=0;k<keyb.length;k++) L.push("b["+keyb[k].node+"]=KV["+(k+1)+"];");
+  if(maddr.length>0){
+    L.push("let ad=("+maddr.map((n,i)=>"(a["+n+"]<<"+i+")").join("|")+")&"+(MEMSZ-1)+";");
+    if(mwe && mdin.length>0)
+      L.push("if(a["+mwe+"]===1)MEM[ad]=("+mdin.map((n,i)=>"(a["+n+"]<<"+i+")").join("|")+")&255;");
+    if(mdout.length>0){
+      L.push("let q=MEM[ad];");
+      mdout.forEach((n,i)=>L.push("b["+n+"]=(q>>"+i+")&1;"));
+    }
+  }
+  watch.forEach((n,w)=>L.push("HIST[(hp%"+HRING+")*"+NWMAX+"+"+(w+1)+"]=b["+n+"];"));
+  L.push("hp++;");
+  L.push("let tmp=a;a=b;b=tmp;");
+  L.push("}");
+  L.push("if(a!==S){for(let i=1;i<="+nn+";i++)S[i]=a[i];}");
+  L.push("return hp;");
+  try{
+    run_fn=new Function("S","X","k","MEM","KV","HIST","hp","HOLDV",L.join("\n"));
+  }catch(e){
+    terr("  [jit failed: "+e.message+"; interpreting]");
+    jit_dead=true; return false;
+  }
+  jit_build_count++;
+  tdim("  [jit: "+nn+" gates + hooks -> JS function, "+(performance.now()-t0).toFixed(1)+" ms]");
+  return true;
+}
+
+function ticks(k){
+  k=Math.floor(k);
+  if(k<=0) return;
+  while(anypend && k>0){ tick_one_interp(); k--; }
+  if(k===0) return;
+  if(dirty && nn>0){ if(jit_build()) dirty=false; }
+  if(!dirty && run_fn){ hp=run_fn(S,X,k,MEM,KV,HIST,hp,HOLDV); return; }
+  for(let i=0;i<k;i++) tick_one_interp();
+}
+
+/* machine file ------------------------------------------------------------ */
+function toks(line){
+  return line.replace(/#.*/,"").split(/[\s,]+/).filter(w=>w.length>0);
+}
+
+function query(i){
+  tprint("  "+NM[i]+" = "+S[i]);
+  let line="  "+NM[i]+" :";
+  if(E[i].length>0){
+    line+=" T-";
+    E[i].forEach((e,k)=>{ line+=(k>0?",":"")+" "+NM[e]; });
+  }
+  let first=true;
+  for(let j=1;j<=nn;j++){
+    for(let k=0;k<E[j].length;k++){
+      if(E[j][k]===i){ line+=(first?" T+":",")+" "+NM[j]; first=false; break; }
+    }
+  }
+  if(E[i].length===0 && first) line+=" (floating: reads 0)";
+  tprint(line);
+  if(hold[i]>=0) tprint("  "+NM[i]+" held at "+hold[i]);
+}
+
+function need(tk,n,what){
+  if(tk.length<n){ terr("line "+lineno+": missing "+what); return false; }
+  return true;
+}
+
+function load_line(line){
+  const tk=toks(line);
+  const t=tk[0];
+  if(!t) return;
+
+  if(t==="hz"){
+    if(need(tk,2,"rate")){
+      const v=parseFloat(tk[1]);
+      hz=Math.max(1, isNaN(v)?240:v);
+    }
+  } else if(t==="screen"){
+    if(need(tk,3,"W H")){
+      scrW=parseInt(tk[1])||0; scrH=parseInt(tk[2])||0;
+      scrS=parseInt(tk[3])||16;
+    }
+  } else if(t==="pix"){
+    if(need(tk,4,"X Y node")){
+      pixb.push({x:parseInt(tk[1])||0, y:parseInt(tk[2])||0, node:id(tk[3])});
+    }
+  } else if(t==="key"){
+    if(need(tk,3,"keyname node") && keyb.length<KEYMAX){
+      keyb.push({name:tk[1], node:id(tk[2]), toggle:tk[3]==="toggle"});
+      KV[keyb.length]=0;
+      dirty=true;
+    }
+  } else if(t==="maddr"||t==="mdin"||t==="mdout"){
+    const bus=(t==="maddr")?maddr:(t==="mdin")?mdin:mdout;
+    bus.length=0;
+    for(let k=1;k<Math.min(tk.length,BUSMAX+1);k++) bus.push(id(tk[k]));
+    dirty=true;
+  } else if(t==="mwe"){
+    if(need(tk,2,"node")){ mwe=id(tk[1]); dirty=true; }
+  } else if(t==="vram"){
+    if(need(tk,4,"ADDR W H")){
+      vaddr=(parseInt(tk[1])||0)&(MEMSZ-1);
+      vW=(parseInt(tk[2])||0)&~7;
+      vH=parseInt(tk[3])||0;
+      vS=parseInt(tk[4])||4;
+    }
+  } else if(t==="mem"){                          // mem ADDR xx xx ...
+    if(need(tk,2,"ADDR")){
+      let ad=(parseInt(tk[1])||0)&(MEMSZ-1);
+      for(let k=2;k<tk.length;k++){
+        MEM[ad]=(parseInt(tk[k],16)||0)&0xFF;
+        ad=(ad+1)&(MEMSZ-1);
+      }
+    }
+  } else if(t==="w"){
+    watch.length=0;
+    for(let k=1;k<Math.min(tk.length,NWMAX+1);k++) watch.push(id(tk[k]));
+    dirty=true;
+  } else if(t==="t"){
+    let n=parseInt(tk[1])||1;
+    if(n>1000000){ tdim("  (t capped at 1000000 per line here)"); n=1000000; }
+    ticks(n);
+  } else if(tk.length===1){                       // query
+    const i=IDX.get(t);
+    if(i) query(i);
+    else tprint("  no node '"+t+"' \u2014 why is a raven like a writing-desk?");
+  } else if(tk[1]==="!"){                         // pulse / hold
+    const i=id(t);
+    const v=tk[2];
+    if(v===undefined){ pend[i]=true; anypend=true; }
+    else{
+      const newval=(v==="1")?1:(v==="0")?0:-1;
+      const was_held=hold[i]>=0;
+      hold[i]=newval;
+      HOLDV[i]=(newval>=0)?newval:0;
+      const now_held=newval>=0;
+      if(was_held!==now_held) dirty=true;
+    }
+  } else if(tk[1]===":"){                         // declare
+    const i=id(t);
+    let mode=0, srcs=[], sawsrc=false;
+    for(let k=2;k<tk.length;k++){
+      const w=tk[k];
+      if(w==="T-"){ mode=0; sawsrc=true; }
+      else if(w==="T+"){ mode=1; }
+      else{
+        const j=id(w);
+        if(mode===0){
+          if(srcs.length<MAXE) srcs.push(j);
+          sawsrc=true;
+        } else if(E[j].length<MAXE) E[j].push(i);
+      }
+    }
+    if(sawsrc) E[i]=srcs;
+    dirty=true;
+  } else {
+    terr("line "+lineno+": ?  (node : T- a b T+ c | node ! [1 0 -] | hooks)");
+  }
+}
+
+function load_source(src){
+  for(const line of src.split(/\r?\n/)){ lineno++; load_line(line); }
+}
+
+/* default machine ----------------------------------------------------------
+   a NAND-only marquee: HATTAR logo preloaded into vram; three twisted
+   inverter rings of coprime odd lengths (11,13,15 -> periods 22,26,30)
+   drive the memory hooks, so the write stream repeats only every
+   lcm = 4290 ticks (~18 s at 240 Hz). LEFT is an address bit (moves the
+   band), RIGHT is a data bit (bleaches it) \u2014 keys touch hooks, not gates,
+   so nothing can knock the rings into the degenerate all-blink orbit. */
+const DEMO = `# \u2500\u2500 HATTAR demo rig \u2500\u2500 NAND-only marquee \u2500\u2500
+# logo sits in RAM; three coprime twisted rings
+# (periods 22, 26, 30) scribble rows 16..19 on
+# an 18-second super-cycle. hold LEFT to throw
+# the band 4 rows down; hold RIGHT to bleach it.
+# try typing:  a0        t 100       one ! 0
+
+hz 240
+screen 16 16 12
+vram 0 32 24 8
+
+# constants
+zero :
+one : T- zero
+
+# ring a \u00b7 11 inverters \u00b7 period 22 \u00b7 address
+a0 : T- a10
+a1 : T- a0
+a2 : T- a1
+a3 : T- a2
+a4 : T- a3
+a5 : T- a4
+a6 : T- a5
+a7 : T- a6
+a8 : T- a7
+a9 : T- a8
+a10 : T- a9
+
+# ring b \u00b7 13 inverters \u00b7 period 26 \u00b7 data
+b0 : T- b12
+b1 : T- b0
+b2 : T- b1
+b3 : T- b2
+b4 : T- b3
+b5 : T- b4
+b6 : T- b5
+b7 : T- b6
+b8 : T- b7
+b9 : T- b8
+b10 : T- b9
+b11 : T- b10
+b12 : T- b11
+
+# ring c \u00b7 15 inverters \u00b7 period 30 \u00b7 data
+c0 : T- c14
+c1 : T- c0
+c2 : T- c1
+c3 : T- c2
+c4 : T- c3
+c5 : T- c4
+c6 : T- c5
+c7 : T- c6
+c8 : T- c7
+c9 : T- c8
+c10 : T- c9
+c11 : T- c10
+c12 : T- c11
+c13 : T- c12
+c14 : T- c13
+
+# seed a travelling defect into each ring
+a2 ! 0
+b2 ! 0
+c2 ! 0
+t 2
+a2 ! -
+b2 ! -
+c2 ! -
+
+# arrow-key hooks
+key up    ku
+key down  kd
+key left  kl
+key right kr
+
+# memory hooks: scribble bytes 64..79 forever;
+# LEFT adds 16 to the address (rows 20..23),
+# RIGHT rides along as data bit 7
+maddr a0 a3 a6 a9 kl zero one
+mdin  b0 b3 b6 b9 c0 c4 c8 kr
+mwe   one
+
+# HATTAR logo, preloaded (vram rows 4..10)
+mem 16 50 72 27 03
+mem 20 50 25 52 05
+mem 24 70 27 72 03
+mem 28 50 25 52 05
+mem 32 50 25 52 05
+mem 40 F0 FF FF 07
+
+# pix lamps: ring taps in corners, arrows mid
+pix 8 3   ku
+pix 8 9   kd
+pix 5 6   kl
+pix 11 6  kr
+pix 0 0   a0
+pix 15 0  b6
+pix 0 15  c7
+pix 15 15 b0
+
+w a0 b0 c0 kl kr
+`;
+
+/* terminal ----------------------------------------------------------------- */
+const TCOLS=58, TKEEP=220;
+let tlines=[], tin="";
+function push(t,c){
+  while(t.length>TCOLS){ tlines.push({t:t.slice(0,TCOLS),c}); t=t.slice(TCOLS); }
+  tlines.push({t,c});
+  if(tlines.length>TKEEP) tlines.splice(0,tlines.length-TKEEP);
+}
+function tprint(s){ push(s,"#49f07d"); }
+function tdim(s){ push(s,"#2b8f4e"); }
+function terr(s){ push(s,"#ff7a6e"); }
+function techo(s){ push(s,"#d9ffe6"); }
+
+function metaHelp(){
+  tdim("native DSL (same as hattar_pc.lua):");
+  tdim("  name : T- a b T+ c    declare gate");
+  tdim("  name !                pulse high one tick");
+  tdim("  name ! 1|0|-          hold / release");
+  tdim("  name                  query node");
+  tdim("  t N / w a b / hz N    step, scope, rate");
+  tdim("  mem ADDR xx xx ..     poke RAM (hex)");
+  tdim("  maddr mdin mdout mwe  memory hooks");
+  tdim("  vram screen pix key   display + input hooks");
+  tdim("meta (this port only):");
+  tdim("  .help .stats .pause .run .reset .clear .pbm .load");
+  tdim("keys: arrows/space/z/x -> machine hooks");
+  tdim("      wasd walk, q/e turn, enter use, esc back");
+}
+
+function metaStats(){
+  tprint("[stats] "+nn+" gates, hp="+hp+(paused?", paused":""));
+  for(let w=1;w<=watch.length;w++){
+    const shown=Math.min(64,hp);
+    let s="  "+NM[watch[w-1]].padEnd(10," ")+" ";
+    for(let k=hp-shown;k<hp;k++)
+      s+=HIST[(k%HRING)*NWMAX+w]===1?FULL:LOW;
+    push(s,"#49f07d");
+  }
+  let nz=0; for(let i=0;i<MEMSZ;i++) if(MEM[i]!==0) nz++;
+  let s="  RAM: "+nz+" nonzero bytes; MEM[0..15] =";
+  for(let i=0;i<16;i++) s+=" "+MEM[i].toString(16).padStart(2,"0");
+  tprint(s);
+  let lit=0; for(const p of pixb) if(S[p.node]===1) lit++;
+  tprint("  pixels lit: "+lit+" / "+pixb.length);
+}
+
+function metaPbm(){
+  if(vaddr<0||vW===0||vH===0){ terr("--pbm: no vram declared"); return; }
+  let out="P1\n"+vW+" "+vH+"\n";
+  for(let y=0;y<vH;y++){
+    const row=[];
+    for(let x=0;x<vW;x++){
+      const by=MEM[(vaddr+y*(vW>>3)+(x>>3))&(MEMSZ-1)];
+      row.push(((by>>(x&7))&1)===1?"1":"0");
+    }
+    out+=row.join(" ")+"\n";
+  }
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(new Blob([out],{type:"image/x-portable-bitmap"}));
+  a.download="hattar.pbm"; a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),5000);
+  tprint("  vram -> hattar.pbm ("+vW+"x"+vH+")");
+}
+
+function bootMachine(src){
+  hardReset();
+  lastSrc=src;
+  load_source(src);
+  tprint("[boot] "+nn+" gates, "+keyb.length+" key hooks, "
+    +(vaddr>=0?"vram "+vW+"x"+vH:"no vram")+", "+pixb.length+" pix");
+  if(keyb.length){
+    const glyph={up:"\u2191",down:"\u2193",left:"\u2190",right:"\u2192",
+                 space:"space",z:"z",x:"x"};
+    tdim("  keys: "+keyb.map(k=>k.name+(glyph[k.name]?"\u2192"+glyph[k.name]:" (unbound)")
+      +(k.toggle?"\u00b7tgl":"")).join("  "));
+  }
+}
+
+function execLine(line){
+  techo("> "+line);
+  const t=line.trim();
+  if(t[0]==="."){
+    const m=t.split(/\s+/)[0];
+    if(m===".help") metaHelp();
+    else if(m===".stats") metaStats();
+    else if(m===".pause"){ paused=true; tdim("  [paused \u2014 step with t N]"); }
+    else if(m===".run"){ paused=false; tdim("  [running at "+hz+" Hz]"); }
+    else if(m===".clear"){ tlines=[]; }
+    else if(m===".reset"){ bootMachine(lastSrc); }
+    else if(m===".pbm") metaPbm();
+    else if(m===".load") openLoader();
+    else terr("  unknown meta \u2014 try .help");
+    return;
+  }
+  lineno++;
+  load_line(line);
+}
+
+/* =========================================================================
+   the room: raycaster with two live-textured voxels
+   ========================================================================= */
+const MAPW=12, MAPH=10;
+const MAP=[
+"111111111111",
+"1....2.3...1",
+"1..........1",
+"1..........1",
+"1..1....1..1",
+"1..........1",
+"1..........1",
+"1..........1",
+"1..........1",
+"111111111111"].map(r=>[...r].map(c=>c==="."?0:+c));
+
+let px=6.5, py=6.8, dirX=0, dirY=-1, plX=0.8, plY=0;
+let mode="walk";            // walk | tty | crt
+let aim=0, aimDist=99;      // what the center ray hits
+
+const cvs=document.getElementById("game");
+const ctx=cvs.getContext("2d");
+let RW=480, RH=300;
+
+/* CRT backing resolution: canvases are still laid out in the original
+   512x400 / 320x400 logical space (all the fillRect/font math below is
+   untouched), but the actual bitmap is CRT_RES_SCALE x denser, so the
+   raycast wall texture and the close-up overlay both look sharper
+   instead of blocky. Bump this further for even higher-res tubes. */
+const CRT_RES_SCALE=2;
+const termC=document.createElement("canvas"); termC.width=512*CRT_RES_SCALE; termC.height=400*CRT_RES_SCALE;
+const termX=termC.getContext("2d");
+const scrC=document.createElement("canvas"); scrC.width=320*CRT_RES_SCALE; scrC.height=400*CRT_RES_SCALE;
+const scrX=scrC.getContext("2d");
+
+function resize(){
+  const a=innerHeight/innerWidth;
+  RH=Math.max(200,Math.min(400,Math.round(RW*a)));
+  cvs.width=RW; cvs.height=RH;
+  ctx.imageSmoothingEnabled=false;
+}
+addEventListener("resize",resize); resize();
+
+/* CRT chrome shared by both tubes */
+function bezel(c,W,H,label,accent){
+  c.fillStyle="#231d15"; c.fillRect(0,0,W,H);
+  c.fillStyle="#3a3128"; c.fillRect(0,0,W,3);
+  c.fillStyle="#120e09"; c.fillRect(0,H-4,W,4);
+  c.fillStyle="#05080a"; c.fillRect(9,9,W-18,H-18);
+  c.fillStyle=accent; c.globalAlpha=.85;
+  c.font="9px ui-monospace,monospace";
+  c.fillText(label,14,H-8);
+  c.globalAlpha=1;
+}
+function scanlines(c,W,H){
+  c.fillStyle="rgba(0,0,0,0.22)";
+  for(let y=12;y<H-12;y+=3) c.fillRect(10,y,W-20,1);
+  const g=c.createRadialGradient(W/2,H/2,H*0.25,W/2,H/2,H*0.75);
+  g.addColorStop(0,"rgba(0,0,0,0)"); g.addColorStop(1,"rgba(0,0,0,0.38)");
+  c.fillStyle=g; c.fillRect(9,9,W-18,H-18);
+}
+
+/* terminal tube ------------------------------------------------------------ */
+function paintTerm(now){
+  const c=termX, W=512, H=400;
+  c.setTransform(CRT_RES_SCALE,0,0,CRT_RES_SCALE,0,0);
+  bezel(c,W,H,"TTY-0 \u00b7 hattar shell","#49f07d");
+  c.fillStyle="#04170c"; c.fillRect(10,10,W-20,H-20);
+  c.font="13px ui-monospace,monospace";
+  c.fillStyle="#2b8f4e";
+  c.fillText("HATTAR TTY",18,26);
+  c.fillText(("hp "+hp).padStart(20," "),W-190,26);
+  c.fillStyle="#14301d"; c.fillRect(16,32,W-32,1);
+
+  const stripH=watch.length?watch.length*13+10:0;
+  const inY=H-30-stripH;
+  const rows=Math.floor((inY-44)/16);
+  const tail=tlines.slice(-rows);
+  let y=48;
+  for(const L of tail){ c.fillStyle=L.c; c.fillText(L.t,18,y); y+=16; }
+
+  // input line
+  c.fillStyle="#49f07d";
+  const caret=(mode==="tty" && Math.floor(now/450)%2===0)?"\u2588":" ";
+  c.fillText("> "+tin.slice(-TCOLS-2)+caret,18,inY);
+
+  // watch strip: tiny logic analyzer
+  if(watch.length){
+    c.fillStyle="#14301d"; c.fillRect(16,inY+8,W-32,1);
+    const N=Math.min(120,hp), x0=96, x1=W-24, step=(x1-x0)/120;
+    for(let w=1;w<=watch.length;w++){
+      const top=inY+14+(w-1)*13;
+      c.fillStyle="#2b8f4e"; c.font="9px ui-monospace,monospace";
+      c.fillText(NM[watch[w-1]].slice(0,9),18,top+8);
+      c.fillStyle="#49f07d";
+      for(let k=0;k<N;k++){
+        const v=HIST[((hp-N+k)%HRING)*NWMAX+w];
+        c.fillRect(x0+k*step, v?top:top+7, Math.max(1,step), 2);
+      }
+    }
+    c.font="13px ui-monospace,monospace";
+  }
+  scanlines(c,W,H);
+}
+
+/* machine screen tube ------------------------------------------------------ */
+function paintScreen(){
+  const c=scrX, W=320, H=400;
+  c.setTransform(CRT_RES_SCALE,0,0,CRT_RES_SCALE,0,0);
+  bezel(c,W,H,"CRT-0 \u00b7 machine output","#ffb648");
+  c.fillStyle="#120c06"; c.fillRect(10,10,W-20,H-20);
+  let y=20;
+  c.font="9px ui-monospace,monospace";
+
+  if(vaddr>=0 && vW>0 && vH>0){
+    c.fillStyle="#b57a24";
+    c.fillText("VRAM "+vW+"\u00d7"+vH+" @ 0x"+vaddr.toString(16).padStart(4,"0"),16,y+8); y+=14;
+    const budget=(pixb.length||scrW)?196:300;
+    const sv=Math.max(1,Math.floor(Math.min((W-32)/vW,budget/vH)));
+    const x0=(W-vW*sv)>>1;
+    c.fillStyle="#1c1207"; c.fillRect(x0-2,y-2,vW*sv+4,vH*sv+4);
+    c.fillStyle="#ffb648";
+    for(let yy=0;yy<vH;yy++){
+      const base=vaddr+yy*(vW>>3);
+      for(let xb=0;xb<(vW>>3);xb++){
+        const by=MEM[(base+xb)&(MEMSZ-1)];
+        if(by===0) continue;
+        for(let b=0;b<8;b++)
+          if((by>>b)&1) c.fillRect(x0+(xb*8+b)*sv, y+yy*sv, sv, sv);
+      }
+    }
+    y+=vH*sv+10;
+  }
+
+  if(pixb.length||scrW>0){
+    let gw=scrW, gh=scrH;
+    if(!gw){ for(const p of pixb){ gw=Math.max(gw,p.x+1); gh=Math.max(gh,p.y+1);} }
+    if(gw>0&&gh>0){
+      c.fillStyle="#b57a24"; c.fillText("PIX "+gw+"\u00d7"+gh,16,y+8); y+=14;
+      const budget=H-64-y;
+      const sp=Math.max(2,Math.floor(Math.min((W-32)/gw,budget/gh)));
+      const x0=(W-gw*sp)>>1;
+      c.fillStyle="#1c1207"; c.fillRect(x0-2,y-2,gw*sp+4,gh*sp+4);
+      for(const p of pixb){
+        c.fillStyle=S[p.node]===1?"#ffb648":"#3a2a12";
+        c.fillRect(x0+p.x*sp+1, y+p.y*sp+1, sp-2, sp-2);
+      }
+      y+=gh*sp+10;
+    }
+  }
+
+  if(vaddr<0 && pixb.length===0){
+    c.fillStyle="#b57a24";
+    c.fillText("no display hooks \u2014 declare vram or pix",16,y+20);
+    y+=40;
+  }
+
+  // hp blinkenlights + footer
+  const ly=H-42;
+  for(let b=19;b>=0;b--){
+    c.fillStyle=((hp>>b)&1)?"#ffb648":"#3a2a12";
+    c.fillRect(16+(19-b)*9,ly,6,6);
+  }
+  c.fillStyle="#b57a24";
+  c.fillText("hp "+hp+"  \u00b7  "+nn+" gates  \u00b7  "+hz+" Hz"+(paused?"  \u00b7  PAUSED":""),16,ly+18);
+  scanlines(c,W,H);
+}
+
+/* raycaster ----------------------------------------------------------------- */
+function render3D(){
+  const W=RW, H=RH;
+  // ceiling / floor
+  let g=ctx.createLinearGradient(0,0,0,H/2);
+  g.addColorStop(0,"#10131a"); g.addColorStop(1,"#04060a");
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,H/2);
+  g=ctx.createLinearGradient(0,H/2,0,H);
+  g.addColorStop(0,"#070503"); g.addColorStop(1,"#1a140c");
+  ctx.fillStyle=g; ctx.fillRect(0,H/2,W,H/2);
+
+  aim=0; aimDist=99;
+  for(let x=0;x<W;x++){
+    const camX=2*x/W-1;
+    const rdx=dirX+plX*camX, rdy=dirY+plY*camX;
+    let mapX=px|0, mapY=py|0;
+    const ddx=rdx===0?1e30:Math.abs(1/rdx);
+    const ddy=rdy===0?1e30:Math.abs(1/rdy);
+    let stepX,stepY,sdx,sdy;
+    if(rdx<0){ stepX=-1; sdx=(px-mapX)*ddx; } else { stepX=1; sdx=(mapX+1-px)*ddx; }
+    if(rdy<0){ stepY=-1; sdy=(py-mapY)*ddy; } else { stepY=1; sdy=(mapY+1-py)*ddy; }
+    let side=0, cell=0, guard=0;
+    while(guard++<64){
+      if(sdx<sdy){ sdx+=ddx; mapX+=stepX; side=0; }
+      else{ sdy+=ddy; mapY+=stepY; side=1; }
+      cell=(MAP[mapY]&&MAP[mapY][mapX])||((mapX<0||mapX>=MAPW||mapY<0||mapY>=MAPH)?1:0);
+      if(cell>0) break;
+    }
+    const perp=side===0?sdx-ddx:sdy-ddy;
+    const h=Math.min(H*8, H/Math.max(perp,0.05));
+    const ds=H/2-h/2;
+
+    if(x===(W>>1)){ aim=cell; aimDist=perp; }
+
+    if(cell>=2){
+      let wallX=side===0? py+perp*rdy : px+perp*rdx;
+      wallX-=Math.floor(wallX);
+      const tex=cell===2?termC:scrC;
+      let tx=(wallX*tex.width)|0;
+      if((side===0&&rdx>0)||(side===1&&rdy<0)) tx=tex.width-1-tx;
+      ctx.drawImage(tex,tx,0,1,tex.height,x,ds,1,h);
+      const fog=Math.min(0.55,perp/14);
+      if(fog>0.02){ ctx.fillStyle="rgba(4,8,6,"+fog+")"; ctx.fillRect(x,ds,1,h); }
+    } else {
+      const base=side===0?52:40;
+      const f=Math.max(0.12,1-perp/9);
+      ctx.fillStyle="rgb("+((base+8)*f|0)+","+((base+4)*f|0)+","+((base-4)*f|0)+")";
+      ctx.fillRect(x,ds,1,h);
+      // faint mortar lines on the concrete
+      if(((side===0?py+perp*rdy:px+perp*rdx)*8|0)%8===0){
+        ctx.fillStyle="rgba(0,0,0,0.25)"; ctx.fillRect(x,ds,1,h);
+      }
+    }
+  }
+}
+
+function drawHUD(now){
+  const W=RW,H=RH;
+  // minimap
+  const mc=5, mx=W-MAPW*mc-8, my=8;
+  ctx.fillStyle="rgba(4,6,5,0.7)"; ctx.fillRect(mx-3,my-3,MAPW*mc+6,MAPH*mc+6);
+  for(let y=0;y<MAPH;y++)for(let x=0;x<MAPW;x++){
+    const c=MAP[y][x];
+    if(!c) continue;
+    ctx.fillStyle=c===2?"#49f07d":c===3?"#ffb648":"#2c2c30";
+    ctx.fillRect(mx+x*mc,my+y*mc,mc-1,mc-1);
+  }
+  ctx.fillStyle="#e8f5ea";
+  ctx.fillRect(mx+px*mc-1,my+py*mc-1,3,3);
+  ctx.strokeStyle="#e8f5ea"; ctx.beginPath();
+  ctx.moveTo(mx+px*mc,my+py*mc); ctx.lineTo(mx+(px+dirX)*mc,my+(py+dirY)*mc); ctx.stroke();
+
+  // crosshair + prompt
+  const near=aim>=2 && aimDist<2.1;
+  ctx.fillStyle=near?(aim===2?"#49f07d":"#ffb648"):"rgba(220,230,220,0.5)";
+  ctx.fillRect(W/2-1,H/2-1,3,3);
+  ctx.font="11px ui-monospace,monospace"; ctx.textAlign="center";
+  if(near){
+    ctx.fillText(aim===2?"[\u23ce] HATTAR TTY":"[\u23ce] inspect CRT",W/2,H/2-14);
+  }
+  // status bar
+  ctx.textAlign="left";
+  ctx.fillStyle="rgba(4,7,5,0.75)"; ctx.fillRect(0,H-16,W,16);
+  ctx.fillStyle="#2b8f4e";
+  ctx.fillText("hp "+hp+" \u00b7 "+nn+" gates \u00b7 "+hz+" Hz"+(paused?" \u00b7 paused":""),6,H-5);
+  ctx.fillStyle="#3d5a45"; ctx.textAlign="right";
+  ctx.fillText("wasd walk \u00b7 q/e turn \u00b7 \u2190\u2191\u2193\u2192 machine",W-6,H-5);
+  ctx.textAlign="left";
+}
+
+function drawOverlay(now){
+  const W=RW,H=RH;
+  ctx.fillStyle="rgba(2,4,3,0.8)"; ctx.fillRect(0,0,W,H);
+  const src=mode==="tty"?termC:scrC;
+  const s=Math.min((W-24)/src.width,(H-34)/src.height);
+  const dw=src.width*s, dh=src.height*s;
+  ctx.drawImage(src,(W-dw)/2,(H-dh)/2-6,dw,dh);
+  ctx.font="10px ui-monospace,monospace"; ctx.textAlign="center";
+  ctx.fillStyle=mode==="tty"?"#2b8f4e":"#b57a24";
+  ctx.fillText(mode==="tty"
+    ?"type a hattar line \u00b7 paste to load \u00b7 arrows still drive the machine \u00b7 esc steps back"
+    :"arrows/space/z/x drive the machine \u00b7 esc steps back",
+    W/2,H-6);
+  ctx.textAlign="left";
+}
+
+/* input ---------------------------------------------------------------------- */
+const walk={w:0,a:0,s:0,d:0,q:0,e:0};
+const PCMAP={ArrowUp:"up",ArrowDown:"down",ArrowLeft:"left",ArrowRight:"right",
+              " ":"space",z:"z",x:"x"};
+
+function pcKey(name,down,repeat){
+  let hit=false;
+  for(let k=0;k<keyb.length;k++){
+    if(keyb[k].name!==name) continue;
+    hit=true;
+    if(keyb[k].toggle){ if(down&&!repeat) KV[k+1]^=1; }
+    else KV[k+1]=down?1:0;
+  }
+  return hit;
+}
+
+function interact(){
+  if(aim===2 && aimDist<2.1) mode="tty";
+  else if(aim===3 && aimDist<2.1) mode="crt";
+  syncMobile();
+}
+
+addEventListener("keydown",e=>{
+  const el=document.activeElement;
+  if(el && (el.id==="src"||el.id==="mline")) return;   // DOM fields own their keys
+  const pc=PCMAP[e.key];
+
+  if(mode==="tty"){
+    if(e.key==="Escape"){ mode="walk"; syncMobile(); e.preventDefault(); return; }
+    if(pc && e.key.startsWith("Arrow")){ pcKey(pc,true,e.repeat); e.preventDefault(); return; }
+    if(e.key==="Enter"){ const l=tin; tin=""; if(l.trim()) execLine(l); e.preventDefault(); return; }
+    if(e.key==="Backspace"){ tin=tin.slice(0,-1); e.preventDefault(); return; }
+    if(e.key.length===1 && !e.ctrlKey && !e.metaKey){ tin+=e.key; e.preventDefault(); }
+    return;
+  }
+  if(mode==="crt"){
+    if(e.key==="Escape"||e.key==="Enter"){ mode="walk"; syncMobile(); e.preventDefault(); return; }
+    if(pc){ pcKey(pc,true,e.repeat); e.preventDefault(); }
+    return;
+  }
+  // walk
+  if(pc){ pcKey(pc,true,e.repeat); e.preventDefault(); return; }
+  const k=e.key.toLowerCase();
+  if(k in walk){ walk[k]=1; return; }
+  if(e.key==="Enter"){ interact(); e.preventDefault(); }
+});
+
+addEventListener("keyup",e=>{
+  const pc=PCMAP[e.key];
+  if(pc) pcKey(pc,false,false);
+  const k=e.key.toLowerCase();
+  if(k in walk) walk[k]=0;
+});
+
+addEventListener("paste",e=>{
+  if(mode!=="tty") return;
+  const txt=(e.clipboardData||window.clipboardData).getData("text");
+  if(!txt) return;
+  e.preventDefault();
+  const lines=txt.split(/\r?\n/);
+  if(lines.length===1){ tin+=lines[0]; return; }
+  tdim("  [pasting "+lines.length+" lines]");
+  for(const l of lines) if(l.trim()) execLine(l);
+});
+
+// mouse look
+cvs.addEventListener("click",()=>{
+  if(mode==="walk" && !isTouch && document.pointerLockElement!==cvs)
+    cvs.requestPointerLock&&cvs.requestPointerLock();
+});
+addEventListener("mousemove",e=>{
+  if(document.pointerLockElement===cvs && mode==="walk") rotate(e.movementX*0.0022);
+});
+
+function rotate(a){
+  const c=Math.cos(a), s=Math.sin(a);
+  let ox=dirX; dirX=dirX*c-dirY*s; dirY=ox*s+dirY*c;
+  ox=plX; plX=plX*c-plY*s; plY=ox*s+plY*c;
+}
+function solid(x,y){
+  if(x<0||y<0||x>=MAPW||y>=MAPH) return true;
+  return MAP[y|0][x|0]!==0;
+}
+function move(dt){
+  if(mode!=="walk") return;
+  const sp=2.7*dt, rs=2.3*dt, r=0.22;
+  if(walk.q) rotate(-rs);
+  if(walk.e) rotate(rs);
+  const fwd=walk.w-walk.s, str=walk.d-walk.a;
+  const vx=dirX*fwd*sp + (-dirY)*str*sp + tvx*sp;
+  const vy=dirY*fwd*sp + ( dirX)*str*sp + tvy*sp;
+  const nx=px+vx, ny=py+vy;
+  if(!solid(nx+Math.sign(vx)*r,py-r)&&!solid(nx+Math.sign(vx)*r,py+r)) px=nx;
+  if(!solid(px-r,ny+Math.sign(vy)*r)&&!solid(px+r,ny+Math.sign(vy)*r)) py=ny;
+}
+
+/* touch ---------------------------------------------------------------------- */
+const isTouch="ontouchstart" in window;
+let tvx=0,tvy=0;                      // touch move vector (world-relative below)
+let stick=null, look=null;
+cvs.addEventListener("touchstart",e=>{
+  for(const t of e.changedTouches){
+    if(t.clientX<innerWidth/2 && !stick) stick={id:t.identifier,x:t.clientX,y:t.clientY};
+    else if(!look) look={id:t.identifier,x:t.clientX,t:performance.now(),moved:0};
+  }
+  e.preventDefault();
+},{passive:false});
+cvs.addEventListener("touchmove",e=>{
+  for(const t of e.changedTouches){
+    if(stick&&t.identifier===stick.id){
+      const dx=(t.clientX-stick.x)/46, dy=(t.clientY-stick.y)/46;
+      const f=Math.max(-1,Math.min(1,-dy)), s=Math.max(-1,Math.min(1,dx));
+      tvx=dirX*f+(-dirY)*s; tvy=dirY*f+(dirX)*s;
+    } else if(look&&t.identifier===look.id){
+      rotate((t.clientX-look.x)*0.007);
+      look.moved+=Math.abs(t.clientX-look.x); look.x=t.clientX;
+    }
+  }
+  e.preventDefault();
+},{passive:false});
+cvs.addEventListener("touchend",e=>{
+  for(const t of e.changedTouches){
+    if(stick&&t.identifier===stick.id){ stick=null; tvx=tvy=0; }
+    else if(look&&t.identifier===look.id){
+      if(performance.now()-look.t<260 && look.moved<12){
+        if(mode==="walk") interact(); else { mode="walk"; syncMobile(); }
+      }
+      look=null;
+    }
+  }
+  e.preventDefault();
+},{passive:false});
+
+/* mobile DOM helpers */
+const mrow=document.getElementById("mrow");
+const mact=document.getElementById("mact");
+const mline=document.getElementById("mline");
+function syncMobile(){
+  mrow.classList.toggle("open", isTouch && mode==="tty");
+  if(isTouch && mode==="tty") setTimeout(()=>mline.focus(),50);
+  else mline.blur();
+}
+mline.addEventListener("keydown",e=>{
+  if(e.key==="Enter"){ const l=mline.value; mline.value=""; if(l.trim()) execLine(l); e.preventDefault(); }
+});
+document.getElementById("mesc").addEventListener("click",()=>{ mode="walk"; syncMobile(); });
+for(const b of mrow.querySelectorAll("[data-pc]")){
+  const n=b.dataset.pc;
+  b.addEventListener("pointerdown",e=>{ pcKey(n,true,false); e.preventDefault(); });
+  b.addEventListener("pointerup",()=>pcKey(n,false,false));
+  b.addEventListener("pointerleave",()=>pcKey(n,false,false));
+}
+mact.addEventListener("click",interact);
+
+/* loader ---------------------------------------------------------------------- */
+const loader=document.getElementById("loader");
+const srcTa=document.getElementById("src");
+function openLoader(){ srcTa.value=lastSrc; loader.classList.add("open"); srcTa.focus(); }
+document.getElementById("loadbtn").addEventListener("click",openLoader);
+document.getElementById("cancel").addEventListener("click",()=>loader.classList.remove("open"));
+document.getElementById("boot").addEventListener("click",()=>{
+  loader.classList.remove("open");
+  tlines=[]; bootMachine(srcTa.value);
+  mode="walk"; syncMobile();
+});
+
+/* boot + main loop -------------------------------------------------------------- */
+tprint("HATTAR-PC :: machine room");
+tdim("the processor on that wall is a pile of NANDs.");
+tdim("type .help \u00b7 walk up and press enter to use me");
+hardReset();
+bootMachine(DEMO);
+
+let last=performance.now(), acc=0;
+function frame(now){
+  const dt=Math.min(0.1,Math.max(0,(now-last)/1000)); last=now;
+  if(!paused){
+    acc+=dt*hz;
+    let n=Math.floor(acc);
+    if(n>0){ acc-=n; ticks(Math.min(n,250000)); }
+  }
+  move(dt);
+  paintTerm(now);
+  paintScreen();
+  render3D();
+  if(mode==="walk"){
+    drawHUD(now);
+    mact.classList.toggle("open", isTouch && aim>=2 && aimDist<2.1);
+  } else {
+    drawOverlay(now);
+    mact.classList.remove("open");
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
