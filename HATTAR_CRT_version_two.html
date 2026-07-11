@@ -1,0 +1,1674 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>HATTAR-PC — machine room</title>
+<style>
+  :root{
+    --ph-green:#49f07d; --ph-green-dim:#2b8f4e;
+    --ph-amber:#ffb648; --ph-cyan:#5ad7ff; --bezel:#231d15; --ink:#0b0d0b;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;background:#050605;overflow:hidden;
+    font-family:ui-monospace,Menlo,Consolas,"Cascadia Mono",monospace}
+  #game{position:fixed;inset:0;width:100vw;height:100vh;display:block;
+    image-rendering:pixelated;image-rendering:crisp-edges;cursor:crosshair}
+  .chip{position:fixed;z-index:5;background:#0c120d;color:var(--ph-green-dim);
+    border:1px solid #1d3a26;padding:6px 10px;font:11px/1 inherit;letter-spacing:.08em;
+    text-transform:lowercase;cursor:pointer}
+  .chip:hover,.chip:focus-visible{color:var(--ph-green);border-color:var(--ph-green-dim);outline:none}
+  #loadbtn{top:10px;right:10px}
+  /* machine loader */
+  #loader{position:fixed;inset:0;z-index:20;background:rgba(3,5,4,.88);
+    display:none;align-items:center;justify-content:center;padding:16px}
+  #loader.open{display:flex}
+  #loadpanel{width:min(720px,100%);background:#070b08;border:1px solid #1d3a26;
+    box-shadow:0 0 60px rgba(73,240,125,.08);padding:14px;display:flex;flex-direction:column;gap:10px}
+  #loadpanel h2{font:12px/1 inherit;color:var(--ph-green);letter-spacing:.15em;text-transform:lowercase}
+  #src{width:100%;height:min(52vh,420px);resize:vertical;background:#04170c;color:#bdf5cf;
+    border:1px solid #14301d;padding:10px;font:12px/1.5 inherit;white-space:pre;overflow:auto}
+  #src:focus-visible{outline:1px solid var(--ph-green-dim)}
+  .row{display:flex;gap:8px;justify-content:flex-end}
+  /* mobile terminal row + interact */
+  #mrow{position:fixed;left:0;right:0;bottom:0;z-index:15;display:none;gap:6px;
+    padding:8px;background:rgba(5,9,6,.92);border-top:1px solid #1d3a26}
+  #mrow.open{display:flex}
+  #mrow button{min-width:40px;background:#0c120d;color:var(--ph-green);border:1px solid #1d3a26;
+    font:14px/1 inherit;padding:8px 0}
+  #mline{flex:1;background:#04170c;border:1px solid #14301d;color:#bdf5cf;
+    font:13px/1.3 inherit;padding:8px}
+  #mact{position:fixed;right:14px;bottom:14px;z-index:15;display:none;
+    background:#0c120d;color:var(--ph-amber);border:1px solid #4a3410;
+    padding:12px 16px;font:13px/1 inherit}
+  #mact.open{display:block}
+  @media (prefers-reduced-motion: reduce){ *{scroll-behavior:auto} }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<button id="loadbtn" class="chip">load .hattar</button>
+
+<div id="loader" role="dialog" aria-label="load machine">
+  <div id="loadpanel">
+    <h2>machine file · paste .hattar source · boot swaps machines, the world persists</h2>
+    <textarea id="src" spellcheck="false" autocapitalize="off"></textarea>
+    <div class="row">
+      <button id="cancel" class="chip" style="position:static">cancel</button>
+      <button id="boot" class="chip" style="position:static">boot</button>
+    </div>
+  </div>
+</div>
+
+<div id="mrow">
+  <button data-pc="left" aria-label="machine left">◀</button>
+  <button data-pc="up" aria-label="machine up">▲</button>
+  <button data-pc="down" aria-label="machine down">▼</button>
+  <button data-pc="right" aria-label="machine right">▶</button>
+  <input id="mline" placeholder="hattar line…" autocapitalize="off" autocomplete="off" spellcheck="false">
+  <button id="mesc">esc</button>
+</div>
+<div id="mact">⏎ use</div>
+
+<script>
+"use strict";
+/* ==========================================================================
+   HATTAR-PC — machine room. JS port of hattar_pc.lua + raycast front-end.
+   The circuit core below mirrors the Lua file line-for-line where possible;
+   the Lua load() "JIT" becomes new Function().
+
+   New in this revision:
+   · VID: a general video system — the raycast buffer and the CRT tube
+     backing stores are both derived from settings, never hardcoded.
+     (.video render 0.15–1  ·  .video crt 1–4, or `video …` machine lines)
+   · warm boot: loading a machine swaps the netlist only; the terminal,
+     your position, and your mode all persist. `.reset` re-boots the
+     current machine, `.clear` wipes the terminal.
+   · `bits 8|16`: the whole memory system is word-width generic — RAM,
+     buses, `mem` pokes, vram, PBM dumps, the monitor, and the MCU all
+     follow. `.demo 8` / `.demo 16` load matching built-ins.
+   · a supervisor MCU (host-emulated, NOT built from NANDs — it just
+     shares the machine's RAM) with a tiny ISA, a 2-pass assembler
+     (.asm … .end), and monitor commands (.d .e .bit .cpu), so raw
+     HATTAR is optional. Raw HATTAR still works everywhere, always.
+   · a third wall console (cyan): a clickable Altair-style front panel
+     for the MCU — switches, EXAM/DEP, RUN/HALT/STEP, and live memory
+     bit LEDs you can click to flip single RAM bits.
+   ========================================================================== */
+
+const MAXE=16, MEMSZ=65536, NWMAX=16, HRING=4096, KEYMAX=32, BUSMAX=16;
+const FULL="\u2588", LOW="\u2581";
+
+/* video system --------------------------------------------------------------
+   every internal resolution is derived from these, not hardcoded:
+   · render: raycast buffer size as a fraction of native (CSS px × DPR)
+   · crt:    density multiplier for the tube backing canvases
+   change at runtime with `.video render X` / `.video crt N`, or from a
+   machine file with `video render X` / `video crt N`. */
+const VID={render:0.5, crt:3, maxW:2560, maxH:2560};
+
+/* circuit core ----------------------------------------------------------- */
+let NM, IDX, E, S, X, pend, hold, HOLDV;
+let nn, anypend, dirty, jit_dead, run_fn;
+let WORDBITS=8, WMASK=0xFF;                 // `bits 8|16` — RAM word width
+let MEM=new Uint8Array(MEMSZ);              // 64Ki words (8 or 16 bit each)
+let maddr, mdin, mdout, mwe;
+let pixb, keyb, KV, KEYIX;
+let watch, HIST=new Uint8Array(HRING*NWMAX), hp;
+let scrW, scrH, scrS, vaddr, vW, vH, vS, hz, lineno;
+let paused=false, lastSrc="";
+
+function hardReset(){
+  NM=[""]; IDX=new Map(); E=[null];
+  S=[0]; X=[0]; pend=[false]; hold=[-1]; HOLDV=[0];
+  nn=0; anypend=false; dirty=true; jit_dead=false; run_fn=null;
+  WORDBITS=8; WMASK=0xFF; MEM=new Uint8Array(MEMSZ);
+  maddr=[]; mdin=[]; mdout=[]; mwe=0;
+  pixb=[]; keyb=[]; KV=[0]; KEYIX={};
+  watch=[]; HIST.fill(0); hp=0;
+  scrW=0; scrH=0; scrS=16; vaddr=-1; vW=0; vH=0; vS=4; hz=240; lineno=0;
+}
+
+function hex4(v){ return (v&0xFFFF).toString(16).padStart(4,"0"); }
+function hexw(v){ return (v&WMASK).toString(16).padStart(WORDBITS>>2,"0"); }
+
+function id(s){
+  let i=IDX.get(s); if(i) return i;
+  nn++; NM[nn]=s; IDX.set(s,nn); E[nn]=[];
+  S[nn]=0; X[nn]=0; pend[nn]=false; hold[nn]=-1; HOLDV[nn]=0;
+  dirty=true; return nn;
+}
+
+/* interpreter (fallback + reference) -------------------------------------- */
+function tick_one_interp(){
+  for(let i=1;i<=nn;i++){
+    const Ei=E[i]; let v=1;
+    for(let j=0;j<Ei.length;j++) v&=S[Ei[j]];
+    let x=Ei.length>0 ? 1-v : 0;              // empty AND=1, NAND -> 0
+    if(pend[i]){ x=1; pend[i]=false; }
+    else if(hold[i]>=0) x=hold[i];
+    X[i]=x;
+  }
+  anypend=false;
+  for(let k=0;k<keyb.length;k++) X[keyb[k].node]=KV[k+1];
+  if(maddr.length>0){
+    let ad=0;
+    for(let i=0;i<maddr.length;i++) ad|=S[maddr[i]]<<i;
+    ad&=MEMSZ-1;
+    if(mwe && S[mwe]===1){
+      let d=0;
+      for(let i=0;i<mdin.length;i++) d|=S[mdin[i]]<<i;
+      MEM[ad]=d&WMASK;
+    }
+    const q=MEM[ad];
+    for(let i=0;i<mdout.length;i++) X[mdout[i]]=(q>>i)&1;
+  }
+  for(let w=1;w<=watch.length;w++) HIST[(hp%HRING)*NWMAX+w]=X[watch[w-1]];
+  hp++;
+  for(let i=1;i<=nn;i++) S[i]=X[i];
+}
+
+/* "JIT": one flat JS function for gates + hooks, compiled with new Function */
+function jit_build(){
+  if(jit_dead) return false;
+  const t0=performance.now();
+  const L=[];
+  L.push("let a=S,b=X;");
+  L.push("for(let t=0;t<k;t++){");
+  for(let i=1;i<=nn;i++){
+    if(hold[i]>=0) L.push("b["+i+"]=HOLDV["+i+"];");
+    else if(E[i].length===0) L.push("b["+i+"]=0;");
+    else L.push("b["+i+"]=1-("+E[i].map(j=>"a["+j+"]").join("&")+");");
+  }
+  for(let k=0;k<keyb.length;k++) L.push("b["+keyb[k].node+"]=KV["+(k+1)+"];");
+  if(maddr.length>0){
+    L.push("let ad=("+maddr.map((n,i)=>"(a["+n+"]<<"+i+")").join("|")+")&"+(MEMSZ-1)+";");
+    if(mwe && mdin.length>0)
+      L.push("if(a["+mwe+"]===1)MEM[ad]=("+mdin.map((n,i)=>"(a["+n+"]<<"+i+")").join("|")+")&"+WMASK+";");
+    if(mdout.length>0){
+      L.push("let q=MEM[ad];");
+      mdout.forEach((n,i)=>L.push("b["+n+"]=(q>>"+i+")&1;"));
+    }
+  }
+  watch.forEach((n,w)=>L.push("HIST[(hp%"+HRING+")*"+NWMAX+"+"+(w+1)+"]=b["+n+"];"));
+  L.push("hp++;");
+  L.push("let tmp=a;a=b;b=tmp;");
+  L.push("}");
+  L.push("if(a!==S){for(let i=1;i<="+nn+";i++)S[i]=a[i];}");
+  L.push("return hp;");
+  try{
+    run_fn=new Function("S","X","k","MEM","KV","HIST","hp","HOLDV",L.join("\n"));
+  }catch(e){
+    terr("  [jit failed: "+e.message+"; interpreting]");
+    jit_dead=true; return false;
+  }
+  tdim("  [jit: "+nn+" gates + hooks -> JS function, "+(performance.now()-t0).toFixed(1)+" ms]");
+  return true;
+}
+
+function ticks(k){
+  k=Math.floor(k);
+  if(k<=0) return;
+  while(anypend && k>0){ tick_one_interp(); k--; }
+  if(k===0) return;
+  if(dirty && nn>0){ if(jit_build()) dirty=false; }
+  if(!dirty && run_fn){ hp=run_fn(S,X,k,MEM,KV,HIST,hp,HOLDV); return; }
+  for(let i=0;i<k;i++) tick_one_interp();
+}
+
+/* machine file ------------------------------------------------------------ */
+function toks(line){
+  return line.replace(/#.*/,"").split(/[\s,]+/).filter(w=>w.length>0);
+}
+
+function query(i){
+  tprint("  "+NM[i]+" = "+S[i]);
+  let line="  "+NM[i]+" :";
+  if(E[i].length>0){
+    line+=" T-";
+    E[i].forEach((e,k)=>{ line+=(k>0?",":"")+" "+NM[e]; });
+  }
+  let first=true;
+  for(let j=1;j<=nn;j++){
+    for(let k=0;k<E[j].length;k++){
+      if(E[j][k]===i){ line+=(first?" T+":",")+" "+NM[j]; first=false; break; }
+    }
+  }
+  if(E[i].length===0 && first) line+=" (floating: reads 0)";
+  tprint(line);
+  if(hold[i]>=0) tprint("  "+NM[i]+" held at "+hold[i]);
+}
+
+function need(tk,n,what){
+  if(tk.length<n){ terr("line "+lineno+": missing "+what); return false; }
+  return true;
+}
+
+function load_line(line){
+  const tk=toks(line);
+  const t=tk[0];
+  if(!t) return;
+
+  if(t==="hz"){
+    if(need(tk,2,"rate")){
+      const v=parseFloat(tk[1]);
+      hz=Math.max(1, isNaN(v)?240:v);
+    }
+  } else if(t==="bits"){                       // bits 8|16 — RAM word width
+    if(need(tk,2,"8|16")){
+      const b=parseInt(tk[1]);
+      if(b===8||b===16){
+        if(b!==WORDBITS){
+          WORDBITS=b; WMASK=(1<<b)-1;
+          MEM=(b===8)?new Uint8Array(MEMSZ):new Uint16Array(MEMSZ);
+          dirty=true;
+          tdim("  [bits "+b+"] 64Ki \u00d7 "+b+"-bit words (RAM cleared)");
+        }
+      } else terr("line "+lineno+": bits must be 8 or 16");
+    }
+  } else if(t==="video"){                      // video render X | video crt N
+    if(need(tk,3,"render X | crt N")) videoSet(tk[1],parseFloat(tk[2]),false);
+  } else if(t==="screen"){
+    if(need(tk,3,"W H")){
+      scrW=parseInt(tk[1])||0; scrH=parseInt(tk[2])||0;
+      scrS=parseInt(tk[3])||16;
+    }
+  } else if(t==="pix"){
+    if(need(tk,4,"X Y node")){
+      pixb.push({x:parseInt(tk[1])||0, y:parseInt(tk[2])||0, node:id(tk[3])});
+    }
+  } else if(t==="key"){
+    if(need(tk,3,"keyname node") && keyb.length<KEYMAX){
+      keyb.push({name:tk[1], node:id(tk[2]), toggle:tk[3]==="toggle"});
+      KV[keyb.length]=0;
+      dirty=true;
+    }
+  } else if(t==="maddr"||t==="mdin"||t==="mdout"){
+    const bus=(t==="maddr")?maddr:(t==="mdin")?mdin:mdout;
+    bus.length=0;
+    for(let k=1;k<Math.min(tk.length,BUSMAX+1);k++) bus.push(id(tk[k]));
+    dirty=true;
+  } else if(t==="mwe"){
+    if(need(tk,2,"node")){ mwe=id(tk[1]); dirty=true; }
+  } else if(t==="vram"){
+    if(need(tk,4,"ADDR W H")){
+      vaddr=(parseInt(tk[1])||0)&(MEMSZ-1);
+      vW=(parseInt(tk[2])||0)&~(WORDBITS-1);   // width multiple of word size
+      vH=parseInt(tk[3])||0;
+      vS=parseInt(tk[4])||4;
+    }
+  } else if(t==="mem"){                        // mem ADDR xx xx ... (hex words)
+    if(need(tk,2,"ADDR")){
+      let ad=(parseInt(tk[1])||0)&(MEMSZ-1);
+      for(let k=2;k<tk.length;k++){
+        MEM[ad]=(parseInt(tk[k],16)||0)&WMASK;
+        ad=(ad+1)&(MEMSZ-1);
+      }
+    }
+  } else if(t==="w"){
+    watch.length=0;
+    for(let k=1;k<Math.min(tk.length,NWMAX+1);k++) watch.push(id(tk[k]));
+    dirty=true;
+  } else if(t==="t"){
+    let n=parseInt(tk[1])||1;
+    if(n>1000000){ tdim("  (t capped at 1000000 per line here)"); n=1000000; }
+    ticks(n);
+  } else if(tk.length===1){                    // query
+    const i=IDX.get(t);
+    if(i) query(i);
+    else tprint("  no node '"+t+"' \u2014 why is a raven like a writing-desk?");
+  } else if(tk[1]==="!"){                      // pulse / hold
+    const i=id(t);
+    const v=tk[2];
+    if(v===undefined){ pend[i]=true; anypend=true; }
+    else{
+      const newval=(v==="1")?1:(v==="0")?0:-1;
+      const was_held=hold[i]>=0;
+      hold[i]=newval;
+      HOLDV[i]=(newval>=0)?newval:0;
+      const now_held=newval>=0;
+      if(was_held!==now_held) dirty=true;
+    }
+  } else if(tk[1]===":"){                      // declare
+    const i=id(t);
+    let mode2=0, srcs=[], sawsrc=false;
+    for(let k=2;k<tk.length;k++){
+      const w=tk[k];
+      if(w==="T-"){ mode2=0; sawsrc=true; }
+      else if(w==="T+"){ mode2=1; }
+      else{
+        const j=id(w);
+        if(mode2===0){
+          if(srcs.length<MAXE) srcs.push(j);
+          sawsrc=true;
+        } else if(E[j].length<MAXE) E[j].push(i);
+      }
+    }
+    if(sawsrc) E[i]=srcs;
+    dirty=true;
+  } else {
+    terr("line "+lineno+": ?  (node : T- a b T+ c | node ! [1 0 -] | hooks)");
+  }
+}
+
+function load_source(src){
+  for(const line of src.split(/\r?\n/)){ lineno++; load_line(line); }
+}
+
+/* default machines -----------------------------------------------------------
+   a NAND-only marquee: HATTAR logo preloaded into RAM; three twisted
+   inverter rings of coprime odd lengths (11,13,15 -> periods 22,26,30)
+   drive the memory hooks, so the write stream repeats only every
+   lcm = 4290 ticks (~18 s at 240 Hz). LEFT is an address bit (moves the
+   band), RIGHT is a data bit (bleaches it) \u2014 keys touch hooks, not gates,
+   so nothing can knock the rings into the degenerate all-blink orbit.
+   DEMO8 is the classic byte machine; DEMO16 is the same rig rebuilt on
+   16-bit words to show `bits 16` end to end. */
+const DEMO8 = `# \u2500\u2500 HATTAR demo rig \u2500\u2500 NAND-only marquee \u00b7 8-bit words \u2500\u2500
+# logo sits in RAM; three coprime twisted rings
+# (periods 22, 26, 30) scribble rows 16..19 on
+# an 18-second super-cycle. hold LEFT to throw
+# the band 4 rows down; hold RIGHT to bleach it.
+# the cyan console is a front panel for the
+# supervisor MCU \u2014 try:  .help   .demo 16   .asm
+# try typing:  a0        t 100       one ! 0
+
+hz 240
+bits 8
+screen 16 16 12
+vram 0 32 24 8
+
+# constants
+zero :
+one : T- zero
+
+# ring a \u00b7 11 inverters \u00b7 period 22 \u00b7 address
+a0 : T- a10
+a1 : T- a0
+a2 : T- a1
+a3 : T- a2
+a4 : T- a3
+a5 : T- a4
+a6 : T- a5
+a7 : T- a6
+a8 : T- a7
+a9 : T- a8
+a10 : T- a9
+
+# ring b \u00b7 13 inverters \u00b7 period 26 \u00b7 data
+b0 : T- b12
+b1 : T- b0
+b2 : T- b1
+b3 : T- b2
+b4 : T- b3
+b5 : T- b4
+b6 : T- b5
+b7 : T- b6
+b8 : T- b7
+b9 : T- b8
+b10 : T- b9
+b11 : T- b10
+b12 : T- b11
+
+# ring c \u00b7 15 inverters \u00b7 period 30 \u00b7 data
+c0 : T- c14
+c1 : T- c0
+c2 : T- c1
+c3 : T- c2
+c4 : T- c3
+c5 : T- c4
+c6 : T- c5
+c7 : T- c6
+c8 : T- c7
+c9 : T- c8
+c10 : T- c9
+c11 : T- c10
+c12 : T- c11
+c13 : T- c12
+c14 : T- c13
+
+# seed a travelling defect into each ring
+a2 ! 0
+b2 ! 0
+c2 ! 0
+t 2
+a2 ! -
+b2 ! -
+c2 ! -
+
+# arrow-key hooks
+key up    ku
+key down  kd
+key left  kl
+key right kr
+
+# memory hooks: scribble bytes 64..79 forever;
+# LEFT adds 16 to the address (rows 20..23),
+# RIGHT rides along as data bit 7
+maddr a0 a3 a6 a9 kl zero one
+mdin  b0 b3 b6 b9 c0 c4 c8 kr
+mwe   one
+
+# HATTAR logo, preloaded (vram rows 4..10)
+mem 16 50 72 27 03
+mem 20 50 25 52 05
+mem 24 70 27 72 03
+mem 28 50 25 52 05
+mem 32 50 25 52 05
+mem 40 F0 FF FF 07
+
+# pix lamps: ring taps in corners, arrows mid
+pix 8 3   ku
+pix 8 9   kd
+pix 5 6   kl
+pix 11 6  kr
+pix 0 0   a0
+pix 15 0  b6
+pix 0 15  c7
+pix 15 15 b0
+
+w a0 b0 c0 kl kr
+`;
+
+const DEMO16 = `# \u2500\u2500 HATTAR demo rig \u2500\u2500 16-bit words \u2500\u2500
+# the same marquee, but RAM is 64Ki \u00d7 16-bit words:
+# buses, mem pokes, and vram all speak 16-bit here.
+# rings scribble word rows 16..23; LEFT throws the
+# band to rows 24..31, where the MCU sample fights it.
+# try:  .help asm   .demo 8   .cpu run
+
+hz 240
+bits 16
+screen 16 16 12
+vram 0 32 32 6
+
+# constants
+zero :
+one : T- zero
+
+# ring a \u00b7 11 inverters \u00b7 period 22 \u00b7 address
+a0 : T- a10
+a1 : T- a0
+a2 : T- a1
+a3 : T- a2
+a4 : T- a3
+a5 : T- a4
+a6 : T- a5
+a7 : T- a6
+a8 : T- a7
+a9 : T- a8
+a10 : T- a9
+
+# ring b \u00b7 13 inverters \u00b7 period 26 \u00b7 data
+b0 : T- b12
+b1 : T- b0
+b2 : T- b1
+b3 : T- b2
+b4 : T- b3
+b5 : T- b4
+b6 : T- b5
+b7 : T- b6
+b8 : T- b7
+b9 : T- b8
+b10 : T- b9
+b11 : T- b10
+b12 : T- b11
+
+# ring c \u00b7 15 inverters \u00b7 period 30 \u00b7 data
+c0 : T- c14
+c1 : T- c0
+c2 : T- c1
+c3 : T- c2
+c4 : T- c3
+c5 : T- c4
+c6 : T- c5
+c7 : T- c6
+c8 : T- c7
+c9 : T- c8
+c10 : T- c9
+c11 : T- c10
+c12 : T- c11
+c13 : T- c12
+c14 : T- c13
+
+# seed a travelling defect into each ring
+a2 ! 0
+b2 ! 0
+c2 ! 0
+t 2
+a2 ! -
+b2 ! -
+c2 ! -
+
+# arrow-key hooks
+key up    ku
+key down  kd
+key left  kl
+key right kr
+
+# word-wide memory hooks: base word 32 (+16 with LEFT);
+# mdin now spreads sixteen ring taps across the word
+maddr a0 a3 a6 a9 kl one
+mdin  b0 b3 b6 b9 c0 c4 c8 kr b1 b4 b7 b10 c1 c5 c9 kr
+mwe   one
+
+# HATTAR logo, packed two bytes per word (vram rows 4..10)
+mem 8  7250 0327
+mem 10 2550 0552
+mem 12 2770 0372
+mem 14 2550 0552
+mem 16 2550 0552
+mem 20 FFF0 07FF
+
+# pix lamps: ring taps in corners, arrows mid
+pix 8 3   ku
+pix 8 9   kd
+pix 5 6   kl
+pix 11 6  kr
+pix 0 0   a0
+pix 15 0  b6
+pix 0 15  c7
+pix 15 15 b0
+
+w a0 b0 c0 kl kr
+`;
+
+/* terminal ----------------------------------------------------------------- */
+const TCOLS=58, TKEEP=220;
+let tlines=[], tin="";
+function push(t,c){
+  while(t.length>TCOLS){ tlines.push({t:t.slice(0,TCOLS),c}); t=t.slice(TCOLS); }
+  tlines.push({t,c});
+  if(tlines.length>TKEEP) tlines.splice(0,tlines.length-TKEEP);
+}
+function tprint(s){ push(s,"#49f07d"); }
+function tdim(s){ push(s,"#2b8f4e"); }
+function terr(s){ push(s,"#ff7a6e"); }
+function techo(s){ push(s,"#d9ffe6"); }
+
+function metaHelp(topic){
+  if(topic==="asm"||topic==="isa"||topic==="cpu"||topic==="mcu"){
+    tdim("supervisor MCU \u00b7 host-emulated, shares RAM \u00b7 width follows `bits`");
+    tdim("  regs: A (acc) \u00b7 X (index) \u00b7 PC (16-bit) \u00b7 flags Z C");
+    tdim("  ldi/lxi imm \u00b7 lda/sta addr \u00b7 ldax/stax (A<->M[X]) \u00b7 tax txa");
+    tdim("  inx dex \u00b7 add/sub/ana/ora/xra addr \u00b7 adi/sbi/ani/ori/xri imm");
+    tdim("  not shl shr \u00b7 jmp/jz/jnz/jc addr \u00b7 djnz addr (X--, jmp if X!=0)");
+    tdim("  in (A=keys: bit0 \u2191 1 \u2193 2 \u2190 3 \u2192 4 spc 5 z 6 x) \u00b7 hlt \u00b7 nop");
+    tdim("  .asm [ADDR] \u2026 lines \u2026 .end \u00b7 labels 'name:' \u00b7 org/db \u00b7 hex numbers");
+    tdim("  note: in 8-bit mode ldax/stax reach page 0 only (X is 8-bit)");
+    return;
+  }
+  tdim("hattar DSL (native, same as hattar_pc.lua):");
+  tdim("  name : T- a b T+ c   declare \u00b7 name ! [1|0|-] pulse/hold \u00b7 name query");
+  tdim("  t N step \u00b7 w a b scope \u00b7 hz N rate \u00b7 bits 8|16 word width");
+  tdim("  mem ADDR xx.. poke \u00b7 maddr/mdin/mdout/mwe \u00b7 vram screen pix key");
+  tdim("  video render 0.15\u20131 | video crt 1\u20134 (also as .video meta)");
+  tdim("monitor \u2014 no HATTAR needed, bit-level access always on:");
+  tdim("  .d [A] [n] dump \u00b7 .e A w w.. deposit \u00b7 .bit A B [0|1] flip one bit");
+  tdim("  .asm [A] \u2026 .end assemble \u00b7 .cpu run|halt|step [n]|pc A|hz N|brk|reset");
+  tdim("  .help asm for the ISA \u00b7 the cyan console is a clickable front panel");
+  tdim("meta: .help .stats .pause .run .reset .clear .pbm .load .demo 8|16 .video");
+  tdim("keys: arrows/space/z/x \u2192 machine hooks \u00b7 wasd walk \u00b7 q/e turn \u00b7 \u23ce use");
+}
+
+function metaStats(){
+  tprint("[stats] "+nn+" gates \u00b7 "+WORDBITS+"-bit words \u00b7 hp="+hp+(paused?" \u00b7 paused":""));
+  tprint("  [mcu] "+(CPU.run?"running":"halted")+" \u00b7 "+cpuStatusLine()+" \u00b7 "+CPU.hz+" ips");
+  for(let w=1;w<=watch.length;w++){
+    const shown=Math.min(64,hp);
+    let s="  "+NM[watch[w-1]].padEnd(10," ")+" ";
+    for(let k=hp-shown;k<hp;k++)
+      s+=HIST[(k%HRING)*NWMAX+w]===1?FULL:LOW;
+    push(s,"#49f07d");
+  }
+  let nz=0; for(let i=0;i<MEMSZ;i++) if(MEM[i]!==0) nz++;
+  let s="  RAM: "+nz+" nonzero words; MEM[0..15] =";
+  for(let i=0;i<16;i++) s+=" "+hexw(MEM[i]);
+  tprint(s);
+  let lit=0; for(const p of pixb) if(S[p.node]===1) lit++;
+  tprint("  pixels lit: "+lit+" / "+pixb.length);
+}
+
+function metaPbm(){
+  if(vaddr<0||vW===0||vH===0){ terr("--pbm: no vram declared"); return; }
+  let out="P1\n"+vW+" "+vH+"\n";
+  const wpr=vW/WORDBITS;
+  for(let y=0;y<vH;y++){
+    const row=[];
+    for(let x=0;x<vW;x++){
+      const wd=MEM[(vaddr+y*wpr+((x/WORDBITS)|0))&(MEMSZ-1)];
+      row.push(((wd>>(x%WORDBITS))&1)===1?"1":"0");
+    }
+    out+=row.join(" ")+"\n";
+  }
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(new Blob([out],{type:"image/x-portable-bitmap"}));
+  a.download="hattar.pbm"; a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),5000);
+  tprint("  vram -> hattar.pbm ("+vW+"\u00d7"+vH+")");
+}
+
+/* supervisor MCU -------------------------------------------------------------
+   a tiny host-emulated accumulator CPU that shares the machine's RAM. It is
+   NOT built from NANDs \u2014 it's a front-panel convenience so the box can be
+   programmed without writing HATTAR. Word width follows `bits`; PC is
+   always 16-bit. The NAND fabric and the MCU read/write the same words,
+   so they can (and in the demos, do) fight over vram. */
+const CPU={run:false, pc:0x0200, a:0, x:0, z:0, cf:0, hz:2000, brk:-1, acc:0};
+function cpuReset(){ CPU.run=false; CPU.pc=0x0200; CPU.a=0; CPU.x=0; CPU.z=0; CPU.cf=0; CPU.acc=0; }
+function cpuStatusLine(){
+  return "pc="+hex4(CPU.pc)+" a="+hexw(CPU.a)+" x="+hexw(CPU.x)+" z="+CPU.z+" c="+CPU.cf;
+}
+function cpuFetch(){ const w=MEM[CPU.pc&0xFFFF]; CPU.pc=(CPU.pc+1)&0xFFFF; return w; }
+function cpuAddr(){
+  if(WORDBITS===16) return cpuFetch()&0xFFFF;
+  const lo=cpuFetch(), hi=cpuFetch();
+  return (lo|(hi<<8))&0xFFFF;
+}
+function inBits(){
+  const order=["up","down","left","right","space","z","x"];
+  let v=0;
+  for(let i=0;i<order.length;i++){ const k=KEYIX[order[i]]; if(k&&KV[k]) v|=1<<i; }
+  return v&WMASK;
+}
+function aluAdd(r){ CPU.cf=r>WMASK?1:0; CPU.a=r&WMASK; CPU.z=CPU.a===0?1:0; }
+function aluSub(r){ CPU.cf=r<0?1:0;     CPU.a=r&WMASK; CPU.z=CPU.a===0?1:0; }
+function aluLog(r){ CPU.a=r&WMASK; CPU.z=CPU.a===0?1:0; }
+function cpuStep(){
+  const op=cpuFetch();
+  let ad;
+  switch(op){
+    case 0x00: break;                                                 // nop
+    case 0x01: CPU.run=false;
+               tdim("  [mcu] hlt @ "+hex4((CPU.pc-1)&0xFFFF)); return false;
+    case 0x02: CPU.a=cpuFetch()&WMASK; break;                         // ldi
+    case 0x03: CPU.a=MEM[cpuAddr()]; break;                           // lda
+    case 0x04: MEM[cpuAddr()]=CPU.a; break;                           // sta
+    case 0x05: CPU.x=cpuFetch()&WMASK; break;                         // lxi
+    case 0x06: CPU.a=MEM[CPU.x&0xFFFF]; break;                        // ldax
+    case 0x07: MEM[CPU.x&0xFFFF]=CPU.a; break;                        // stax
+    case 0x08: CPU.x=(CPU.x+1)&WMASK; CPU.z=CPU.x===0?1:0; break;     // inx
+    case 0x09: CPU.x=(CPU.x-1)&WMASK; CPU.z=CPU.x===0?1:0; break;     // dex
+    case 0x0a: CPU.x=CPU.a; break;                                    // tax
+    case 0x0b: CPU.a=CPU.x; break;                                    // txa
+    case 0x0c: aluAdd(CPU.a+MEM[cpuAddr()]); break;                   // add
+    case 0x0d: aluAdd(CPU.a+(cpuFetch()&WMASK)); break;               // adi
+    case 0x0e: aluSub(CPU.a-MEM[cpuAddr()]); break;                   // sub
+    case 0x0f: aluSub(CPU.a-(cpuFetch()&WMASK)); break;               // sbi
+    case 0x10: aluLog(CPU.a&MEM[cpuAddr()]); break;                   // ana
+    case 0x11: aluLog(CPU.a&cpuFetch()); break;                       // ani
+    case 0x12: aluLog(CPU.a|MEM[cpuAddr()]); break;                   // ora
+    case 0x13: aluLog(CPU.a|cpuFetch()); break;                       // ori
+    case 0x14: aluLog(CPU.a^MEM[cpuAddr()]); break;                   // xra
+    case 0x15: aluLog(CPU.a^cpuFetch()); break;                       // xri
+    case 0x16: aluLog(~CPU.a); break;                                 // not
+    case 0x17: CPU.cf=(CPU.a>>(WORDBITS-1))&1; aluLog(CPU.a<<1); break; // shl
+    case 0x18: CPU.cf=CPU.a&1; aluLog(CPU.a>>1); break;               // shr
+    case 0x19: CPU.pc=cpuAddr(); break;                               // jmp
+    case 0x1a: ad=cpuAddr(); if(CPU.z) CPU.pc=ad; break;              // jz
+    case 0x1b: ad=cpuAddr(); if(!CPU.z) CPU.pc=ad; break;             // jnz
+    case 0x1c: ad=cpuAddr(); if(CPU.cf) CPU.pc=ad; break;             // jc
+    case 0x1d: ad=cpuAddr(); CPU.x=(CPU.x-1)&WMASK;
+               if(CPU.x!==0) CPU.pc=ad; break;                        // djnz
+    case 0x1e: CPU.a=inBits(); break;                                 // in
+    default:
+      CPU.run=false;
+      terr("  [mcu] bad opcode "+hexw(op)+" @ "+hex4((CPU.pc-1)&0xFFFF));
+      return false;
+  }
+  return true;
+}
+function cpuSetRun(v){
+  CPU.run=v; CPU.acc=0;
+  tdim(v?"  [mcu] running @ "+CPU.hz+" ips":"  [mcu] halted @ "+hex4(CPU.pc));
+}
+function cpuStepN(n){
+  for(let i=0;i<n;i++){
+    if(i>0 && CPU.pc===CPU.brk){ tdim("  [mcu] break @ "+hex4(CPU.pc)); break; }
+    if(!cpuStep()) break;
+  }
+  tdim("  [mcu] "+cpuStatusLine());
+}
+function cpuFrame(n){                        // free-run slice, called per frame
+  for(let i=0;i<n;i++){
+    if(CPU.pc===CPU.brk){ CPU.run=false; tdim("  [mcu] break @ "+hex4(CPU.pc)); return; }
+    if(!cpuStep()) return;
+  }
+}
+
+/* two-pass assembler --------------------------------------------------------
+   syntax:  [label:] op [arg]   \u00b7 comments ; or #  \u00b7 numbers are hex
+   directives: org ADDR \u00b7 db w w \u2026   \u00b7 operand size follows `bits`   */
+const OPS={ nop:[0x00,0], hlt:[0x01,0], ldi:[0x02,1], lda:[0x03,2], sta:[0x04,2],
+  lxi:[0x05,1], ldax:[0x06,0], stax:[0x07,0], inx:[0x08,0], dex:[0x09,0],
+  tax:[0x0a,0], txa:[0x0b,0], add:[0x0c,2], adi:[0x0d,1], sub:[0x0e,2],
+  sbi:[0x0f,1], ana:[0x10,2], ani:[0x11,1], ora:[0x12,2], ori:[0x13,1],
+  xra:[0x14,2], xri:[0x15,1], not:[0x16,0], shl:[0x17,0], shr:[0x18,0],
+  jmp:[0x19,2], jz:[0x1a,2], jnz:[0x1b,2], jc:[0x1c,2], djnz:[0x1d,2],
+  in:[0x1e,0] };
+
+function assembleLines(org, lines){
+  const items=[], errs=[];
+  for(let ln=0; ln<lines.length; ln++){
+    let s=lines[ln].replace(/[;#].*/,"").trim();
+    if(!s) continue;
+    let label=null;
+    const mlab=s.match(/^([A-Za-z_]\w*)\s*:/);
+    if(mlab){ label=mlab[1].toLowerCase(); s=s.slice(mlab[0].length).trim(); }
+    let op=null, args=[];
+    if(s){ const p=s.split(/[\s,]+/); op=p[0].toLowerCase(); args=p.slice(1); }
+    items.push({label, op, args, ln:ln+1});
+  }
+  const abits=(WORDBITS===8)?2:1;                // words per address operand
+  const labels={};
+  let pc=org&0xFFFF;
+  for(const it of items){                        // pass 1: label addresses
+    if(it.label) labels[it.label]=pc;
+    if(!it.op) continue;
+    if(it.op==="org"){
+      const v=parseInt((it.args[0]||"").replace(/^0x/,""),16);
+      if(isNaN(v)) errs.push("line "+it.ln+": org needs a hex address");
+      else pc=v&0xFFFF;
+      continue;
+    }
+    if(it.op==="db"||it.op==="dw"||it.op==="word"){ pc=(pc+it.args.length)&0xFFFF; continue; }
+    const d=OPS[it.op];
+    if(!d){ errs.push("line "+it.ln+": unknown op '"+it.op+"'"); continue; }
+    pc=(pc+1+(d[1]===0?0:(d[1]===1?1:abits)))&0xFFFF;
+  }
+  function num(tok, ln){
+    if(tok===undefined){ errs.push("line "+ln+": missing operand"); return 0; }
+    const t=tok.toLowerCase();
+    if(labels[t]!==undefined) return labels[t];
+    const v=parseInt(t.replace(/^0x/,""),16);
+    if(isNaN(v)){ errs.push("line "+ln+": bad number/label '"+tok+"'"); return 0; }
+    return v;
+  }
+  pc=org&0xFFFF;
+  const out=[]; let lo=null, hi=null;
+  const emit=w=>{
+    out.push([pc&0xFFFF, w&WMASK]);
+    if(lo===null||pc<lo) lo=pc;
+    if(hi===null||pc>hi) hi=pc;
+    pc=(pc+1)&0xFFFF;
+  };
+  for(const it of items){                        // pass 2: emit
+    if(!it.op) continue;
+    if(it.op==="org"){ pc=num(it.args[0],it.ln)&0xFFFF; continue; }
+    if(it.op==="db"||it.op==="dw"||it.op==="word"){
+      for(const a of it.args) emit(num(a,it.ln)); continue;
+    }
+    const d=OPS[it.op]; if(!d) continue;
+    emit(d[0]);
+    if(d[1]===1) emit(num(it.args[0],it.ln));
+    else if(d[1]===2){
+      const a=num(it.args[0],it.ln)&0xFFFF;
+      if(WORDBITS===8){ emit(a&255); emit(a>>8); } else emit(a);
+    }
+  }
+  return {errs, out, lo, hi};
+}
+
+let asmBuf=null;
+function asmEnd(){
+  const buf=asmBuf; asmBuf=null;
+  const r=assembleLines(buf.org, buf.lines);
+  if(r.errs.length){
+    for(const e of r.errs) terr("  "+e);
+    terr("  [asm] "+r.errs.length+" error(s) \u2014 nothing written");
+    return;
+  }
+  if(!r.out.length){ tdim("  [asm] nothing to assemble"); return; }
+  for(const wv of r.out) MEM[wv[0]]=wv[1];
+  tprint("  [asm] "+r.out.length+" words @ "+hex4(r.lo)+"\u2013"+hex4(r.hi));
+  CPU.pc=buf.org&0xFFFF;
+  tdim("  [mcu] pc="+hex4(CPU.pc)+" \u00b7 .cpu run, .cpu step, or panel RUN");
+}
+
+function sampleLines(){
+  const band=(WORDBITS===16)?"30":"50";
+  return [
+    "; sample: invert a vram band forever (fights the NAND rings for it)",
+    "start: ldi 10",
+    "       sta ff",
+    "       lxi "+band,
+    "next:  ldax",
+    "       not",
+    "       stax",
+    "       inx",
+    "       lda ff",
+    "       sbi 1",
+    "       sta ff",
+    "       jnz next",
+    "       jmp start"
+  ];
+}
+function loadSample(){
+  const r=assembleLines(0x0200, sampleLines());
+  if(r.errs.length){ for(const e of r.errs) terr("  "+e); return; }
+  for(const wv of r.out) MEM[wv[0]]=wv[1];
+  CPU.pc=0x0200;
+  tdim("  [mcu] sample @ 0200 inverts a vram band \u2014 panel RUN or .cpu run");
+}
+
+/* monitor ------------------------------------------------------------------ */
+function hexArg(s){ return parseInt(String(s).replace(/^0x/,""),16); }
+function metaD(tk){
+  const a=(tk[1]!==undefined)?(hexArg(tk[1])&0xFFFF):latch;
+  const n=Math.max(1,Math.min(512,parseInt(tk[2]||"64",10)||64));
+  const per=(WORDBITS===8)?16:8;
+  for(let r=0;r<n;r+=per){
+    let s="  "+hex4(a+r)+":";
+    for(let k=0;k<per && r+k<n;k++) s+=" "+hexw(MEM[(a+r+k)&0xFFFF]);
+    tprint(s);
+  }
+}
+function metaE(tk){
+  if(tk.length<3){ terr("  .e ADDR w w \u2026 (hex)"); return; }
+  const a0=hexArg(tk[1])&0xFFFF;
+  let a=a0;
+  for(let k=2;k<tk.length;k++){
+    MEM[a]=(parseInt(tk[k],16)||0)&WMASK;
+    a=(a+1)&0xFFFF;
+  }
+  latch=a0;
+  tdim("  [e] "+(tk.length-2)+" word(s) @ "+hex4(a0)+" \u00b7 panel latch follows");
+}
+function metaBit(tk){
+  if(tk.length<3){ terr("  .bit ADDR BIT [0|1]  (toggles if no value)"); return; }
+  const a=hexArg(tk[1])&0xFFFF;
+  const b=parseInt(tk[2],10);
+  if(isNaN(b)||b<0||b>=WORDBITS){ terr("  bit must be 0\u2013"+(WORDBITS-1)); return; }
+  if(tk[3]==="0") MEM[a]&=~(1<<b);
+  else if(tk[3]==="1") MEM[a]|=(1<<b);
+  else MEM[a]^=(1<<b);
+  latch=a;
+  tprint("  ["+hex4(a)+"] bit"+b+" \u2192 "+((MEM[a]>>b)&1)+"   word="+hexw(MEM[a]));
+}
+function metaCpu(tk){
+  const s=tk[1];
+  if(!s){
+    tprint("  [mcu] "+(CPU.run?"running":"halted")+" \u00b7 "+cpuStatusLine()
+      +" \u00b7 "+CPU.hz+" ips"+(CPU.brk>=0?" \u00b7 brk "+hex4(CPU.brk):""));
+    return;
+  }
+  if(s==="run") cpuSetRun(true);
+  else if(s==="halt"||s==="stop") cpuSetRun(false);
+  else if(s==="step") cpuStepN(Math.max(1,Math.min(100000,parseInt(tk[2]||"1",10)||1)));
+  else if(s==="pc"&&tk[2]!==undefined){
+    CPU.pc=hexArg(tk[2])&0xFFFF;
+    tdim("  [mcu] pc="+hex4(CPU.pc));
+  }
+  else if(s==="hz"&&tk[2]!==undefined){
+    CPU.hz=Math.max(1,Math.min(2e6,parseFloat(tk[2])||2000));
+    tdim("  [mcu] "+CPU.hz+" ips");
+  }
+  else if(s==="brk"){
+    if(tk[2]===undefined||tk[2]==="off"){ CPU.brk=-1; tdim("  [mcu] brk off"); }
+    else{ CPU.brk=hexArg(tk[2])&0xFFFF; tdim("  [mcu] brk @ "+hex4(CPU.brk)); }
+  }
+  else if(s==="reset"){ cpuReset(); tdim("  [mcu] reset \u00b7 "+cpuStatusLine()); }
+  else terr("  .cpu run|halt|step [n]|pc A|hz N|brk [A|off]|reset");
+}
+
+function videoSet(kind, val, fromMeta){
+  if(kind==="render"){
+    VID.render=Math.max(0.15, Math.min(1, isNaN(val)?0.5:val));
+    resize();
+    if(fromMeta) tdim("  [video] render "+VID.render.toFixed(2)+" \u2192 "+RW+"\u00d7"+RH);
+  } else if(kind==="crt"){
+    setCrt(val);
+    if(fromMeta) tdim("  [video] crt \u00d7"+VID.crt+" (tty tube "+termC.width+"\u00d7"+termC.height+")");
+  } else if(fromMeta) terr("  .video render 0.15\u20131 | .video crt 1\u20134");
+  else terr("line "+lineno+": video render X | video crt N");
+}
+
+function meta(t){
+  const tk=t.split(/\s+/);
+  const m=tk[0];
+  if(m===".help") metaHelp(tk[1]);
+  else if(m===".stats") metaStats();
+  else if(m===".pause"){ paused=true; tdim("  [paused \u2014 step with t N]"); }
+  else if(m===".run"){ paused=false; tdim("  [running at "+hz+" Hz]"); }
+  else if(m===".clear") tlines=[];
+  else if(m===".reset") bootMachine(lastSrc);
+  else if(m===".pbm") metaPbm();
+  else if(m===".load") openLoader();
+  else if(m===".demo") bootDemo(tk[1]==="16"?16:8);
+  else if(m===".video"){
+    if(tk[1]) videoSet(tk[1],parseFloat(tk[2]),true);
+    else{
+      tprint("  [video] render "+VID.render.toFixed(2)+" \u2192 "+RW+"\u00d7"+RH+" \u00b7 crt \u00d7"+VID.crt);
+      tdim("  .video render 0.15\u20131 \u00b7 .video crt 1\u20134");
+    }
+  }
+  else if(m===".d") metaD(tk);
+  else if(m===".e") metaE(tk);
+  else if(m===".bit") metaBit(tk);
+  else if(m===".cpu") metaCpu(tk);
+  else if(m===".asm"){
+    const org=(tk[1]!==undefined)?(hexArg(tk[1])&0xFFFF):0x0200;
+    asmBuf={org, lines:[]};
+    tdim("  [asm @ "+hex4(org)+"] type instructions \u00b7 .end assembles \u00b7 .abort cancels");
+  }
+  else terr("  unknown meta \u2014 try .help");
+}
+
+/* boot ----------------------------------------------------------------------
+   warm by default: only the machine swaps. Terminal history, your position,
+   your mode, and the video settings all persist across boots. */
+function bootMachine(src){
+  hardReset();
+  lastSrc=src;
+  load_source(src);
+  KEYIX={};
+  keyb.forEach((k,i)=>{ KEYIX[k.name]=i+1; });
+  cpuReset();
+  latch=(vaddr>=0)?vaddr:0; swAddr=0x0200; swData=0;
+  tprint("[boot] "+nn+" gates \u00b7 "+WORDBITS+"-bit words \u00b7 "+keyb.length
+    +" key hooks \u00b7 "+(vaddr>=0?"vram "+vW+"\u00d7"+vH:"no vram")+" \u00b7 "+pixb.length+" pix");
+  if(keyb.length){
+    const glyph={up:"\u2191",down:"\u2193",left:"\u2190",right:"\u2192",
+                 space:"space",z:"z",x:"x"};
+    tdim("  keys: "+keyb.map(k=>k.name+(glyph[k.name]?"\u2192"+glyph[k.name]:" (unbound)")
+      +(k.toggle?"\u00b7tgl":"")).join("  "));
+  }
+}
+function bootDemo(b){
+  bootMachine(b===16?DEMO16:DEMO8);
+  loadSample();
+}
+
+function execLine(line){
+  techo((asmBuf?"asm> ":"> ")+line);
+  const t=line.trim();
+  if(asmBuf){
+    if(t===".end") asmEnd();
+    else if(t===".abort"){ asmBuf=null; tdim("  [asm] aborted"); }
+    else asmBuf.lines.push(line);
+    return;
+  }
+  if(t[0]==="."){ meta(t); return; }
+  lineno++;
+  load_line(line);
+}
+
+/* =========================================================================
+   the room: raycaster with three live-textured voxels
+   ========================================================================= */
+const MAPW=12, MAPH=10;
+const MAP=[
+"111111111111",
+"1....2.3.4.1",
+"1..........1",
+"1..........1",
+"1..1....1..1",
+"1..........1",
+"1..........1",
+"1..........1",
+"1..........1",
+"111111111111"].map(r=>[...r].map(c=>c==="."?0:+c));
+
+let px=6.5, py=6.8, dirX=0, dirY=-1, plX=0.8, plY=0;
+let mode="walk";            // walk | tty | crt | pnl
+let aim=0, aimDist=99;      // what the center ray hits
+
+const cvs=document.getElementById("game");
+const ctx=cvs.getContext("2d");
+let RW=960, RH=600;
+
+/* raycast buffer: derived from window size, DPR, and VID.render \u2014 the
+   internal resolution is a setting, not a constant. */
+function resize(){
+  const dpr=Math.max(1, Math.min(3, window.devicePixelRatio||1));
+  RW=Math.max(320, Math.min(VID.maxW, Math.round(innerWidth*dpr*VID.render)));
+  RH=Math.max(200, Math.min(VID.maxH, Math.round(RW*innerHeight/Math.max(1,innerWidth))));
+  cvs.width=RW; cvs.height=RH;
+  cvs.style.imageRendering=(VID.render>=0.9)?"auto":"pixelated";
+  ctx.imageSmoothingEnabled=false;
+}
+addEventListener("resize",resize); resize();
+
+/* CRT tubes: logical layout space is fixed (512\u00d7400 / 320\u00d7400) so all the
+   drawing math below stays put, but the backing bitmap is VID.crt \u00d7 denser.
+   setCrt() rebuilds them live. */
+function makeTube(w,h){
+  const c=document.createElement("canvas");
+  c._lw=w; c._lh=h;
+  c.width=w*VID.crt; c.height=h*VID.crt;
+  return c;
+}
+const termC=makeTube(512,400), scrC=makeTube(320,400), pnlC=makeTube(512,400);
+const termX=termC.getContext("2d"), scrX=scrC.getContext("2d"), pnlX=pnlC.getContext("2d");
+function setCrt(n){
+  VID.crt=Math.max(1, Math.min(4, Math.round(n)||2));
+  for(const c of [termC,scrC,pnlC]){ c.width=c._lw*VID.crt; c.height=c._lh*VID.crt; }
+}
+
+/* CRT chrome shared by all tubes */
+function bezel(c,W,H){
+  c.fillStyle="#231d15"; c.fillRect(0,0,W,H);
+  c.fillStyle="#3a3128"; c.fillRect(0,0,W,3);
+  c.fillStyle="#120e09"; c.fillRect(0,H-4,W,4);
+  c.fillStyle="#05080a"; c.fillRect(9,9,W-18,H-18);
+}
+function tubeLabel(c,W,H,label,accent){       // drawn AFTER content so the
+  c.fillStyle=accent; c.globalAlpha=.85;      // screen fill can't clip it
+  c.font="9px ui-monospace,monospace";
+  c.fillText(label,14,H-8); c.globalAlpha=1;
+}
+function scanlines(c,W,H){
+  c.fillStyle="rgba(0,0,0,0.22)";
+  for(let y=12;y<H-12;y+=3) c.fillRect(10,y,W-20,1);
+  const g=c.createRadialGradient(W/2,H/2,H*0.25,W/2,H/2,H*0.75);
+  g.addColorStop(0,"rgba(0,0,0,0)"); g.addColorStop(1,"rgba(0,0,0,0.38)");
+  c.fillStyle=g; c.fillRect(9,9,W-18,H-18);
+}
+
+/* terminal tube ------------------------------------------------------------ */
+function paintTerm(now){
+  const c=termX, W=512, H=400;
+  c.setTransform(VID.crt,0,0,VID.crt,0,0);
+  bezel(c,W,H);
+  c.fillStyle="#04170c"; c.fillRect(10,10,W-20,H-24);
+  c.font="13px ui-monospace,monospace";
+  c.fillStyle="#2b8f4e";
+  c.fillText("HATTAR TTY",18,26);
+  c.fillText(("hp "+hp).padStart(20," "),W-190,26);
+  c.fillStyle="#14301d"; c.fillRect(16,32,W-32,1);
+
+  const stripH=watch.length?watch.length*13+10:0;
+  const inY=H-32-stripH;
+  const rows=Math.floor((inY-44)/16);
+  const tail=tlines.slice(-rows);
+  let y=48;
+  for(const L of tail){ c.fillStyle=L.c; c.fillText(L.t,18,y); y+=16; }
+
+  // input line
+  c.fillStyle="#49f07d";
+  const prm=asmBuf?"asm> ":"> ";
+  const caret=(mode==="tty" && Math.floor(now/450)%2===0)?"\u2588":" ";
+  c.fillText(prm+tin.slice(-(TCOLS+2))+caret,18,inY);
+
+  // watch strip: tiny logic analyzer
+  if(watch.length){
+    c.fillStyle="#14301d"; c.fillRect(16,inY+8,W-32,1);
+    const N=Math.min(120,hp), x0=96, x1=W-24, step=(x1-x0)/120;
+    for(let w=1;w<=watch.length;w++){
+      const top=inY+14+(w-1)*13;
+      c.fillStyle="#2b8f4e"; c.font="9px ui-monospace,monospace";
+      c.fillText(NM[watch[w-1]].slice(0,9),18,top+8);
+      c.fillStyle="#49f07d";
+      for(let k=0;k<N;k++){
+        const v=HIST[((hp-N+k)%HRING)*NWMAX+w];
+        c.fillRect(x0+k*step, v?top:top+7, Math.max(1,step), 2);
+      }
+    }
+    c.font="13px ui-monospace,monospace";
+  }
+  tubeLabel(c,W,H,"TTY-0 \u00b7 hattar shell","#49f07d");
+  scanlines(c,W,H);
+}
+
+/* machine screen tube ------------------------------------------------------ */
+function paintScreen(){
+  const c=scrX, W=320, H=400;
+  c.setTransform(VID.crt,0,0,VID.crt,0,0);
+  bezel(c,W,H);
+  c.fillStyle="#120c06"; c.fillRect(10,10,W-20,H-24);
+  let y=20;
+  c.font="9px ui-monospace,monospace";
+
+  if(vaddr>=0 && vW>0 && vH>0){
+    c.fillStyle="#b57a24";
+    c.fillText("VRAM "+vW+"\u00d7"+vH+" @ 0x"+vaddr.toString(16).padStart(4,"0")
+      +" \u00b7 "+WORDBITS+"-bit words",16,y+8); y+=14;
+    const budget=(pixb.length||scrW)?196:300;
+    const sv=Math.max(1,Math.floor(Math.min((W-32)/vW,budget/vH)));
+    const x0=(W-vW*sv)>>1;
+    c.fillStyle="#1c1207"; c.fillRect(x0-2,y-2,vW*sv+4,vH*sv+4);
+    c.fillStyle="#ffb648";
+    const wpr=vW/WORDBITS;
+    for(let yy=0;yy<vH;yy++){
+      const base=vaddr+yy*wpr;
+      for(let xw=0;xw<wpr;xw++){
+        const wd=MEM[(base+xw)&(MEMSZ-1)];
+        if(wd===0) continue;
+        for(let b=0;b<WORDBITS;b++)
+          if((wd>>b)&1) c.fillRect(x0+(xw*WORDBITS+b)*sv, y+yy*sv, sv, sv);
+      }
+    }
+    y+=vH*sv+10;
+  }
+
+  if(pixb.length||scrW>0){
+    let gw=scrW, gh=scrH;
+    if(!gw){ for(const p of pixb){ gw=Math.max(gw,p.x+1); gh=Math.max(gh,p.y+1);} }
+    if(gw>0&&gh>0){
+      c.fillStyle="#b57a24"; c.fillText("PIX "+gw+"\u00d7"+gh,16,y+8); y+=14;
+      const budget=H-64-y;
+      const sp=Math.max(2,Math.floor(Math.min((W-32)/gw,budget/gh)));
+      const x0=(W-gw*sp)>>1;
+      c.fillStyle="#1c1207"; c.fillRect(x0-2,y-2,gw*sp+4,gh*sp+4);
+      for(const p of pixb){
+        c.fillStyle=S[p.node]===1?"#ffb648":"#3a2a12";
+        c.fillRect(x0+p.x*sp+1, y+p.y*sp+1, sp-2, sp-2);
+      }
+      y+=gh*sp+10;
+    }
+  }
+
+  if(vaddr<0 && pixb.length===0){
+    c.fillStyle="#b57a24";
+    c.fillText("no display hooks \u2014 declare vram or pix",16,y+20);
+    y+=40;
+  }
+
+  // hp blinkenlights + footer
+  const ly=H-46;
+  for(let b=19;b>=0;b--){
+    c.fillStyle=((hp>>b)&1)?"#ffb648":"#3a2a12";
+    c.fillRect(16+(19-b)*9,ly,6,6);
+  }
+  c.fillStyle="#b57a24";
+  c.fillText("hp "+hp+"  \u00b7  "+nn+" gates  \u00b7  "+hz+" Hz"+(paused?"  \u00b7  PAUSED":""),16,ly+18);
+  tubeLabel(c,W,H,"CRT-0 \u00b7 machine output","#ffb648");
+  scanlines(c,W,H);
+}
+
+/* front panel tube -----------------------------------------------------------
+   an Altair-style console for the supervisor MCU. Everything drawn here is
+   clickable in the close-up view: switches toggle, buttons fire, and the
+   live MEM row flips single RAM bits \u2014 bit-level access without any HATTAR. */
+let swAddr=0x0200, swData=0, latch=0;
+let PANEL_HIT=[];
+
+function pbtn(c,x,y,w,h,label,fn,lit){
+  c.fillStyle=lit?"#0f3542":"#0a1c24"; c.fillRect(x,y,w,h);
+  c.strokeStyle=lit?"#5ad7ff":"#1c4a5e"; c.lineWidth=1;
+  c.strokeRect(x+.5,y+.5,w-1,h-1);
+  c.fillStyle=lit?"#bdefff":"#5ad7ff"; c.font="9px ui-monospace,monospace";
+  c.textAlign="center"; c.fillText(label,x+w/2,y+h/2+3.5); c.textAlign="left";
+  PANEL_HIT.push({x,y,w,h,fn});
+}
+function pled(c,x,y,v,fn){
+  if(v){ c.fillStyle="rgba(90,215,255,0.22)"; c.fillRect(x-2,y-2,13,13); }
+  c.fillStyle=v?"#7fe3ff":"#10222c"; c.fillRect(x,y,9,9);
+  if(fn) PANEL_HIT.push({x:x-2,y:y-2,w:13,h:13,fn});
+}
+function pledRow(c,x,y,bits,val,fnBit){
+  for(let b=bits-1;b>=0;b--)
+    pled(c, x+(bits-1-b)*14, y, (val>>b)&1, fnBit?(()=>fnBit(b)):null);
+}
+function pswRow(c,x,y,bits,val,flip){
+  for(let b=bits-1;b>=0;b--){
+    const xx=x+(bits-1-b)*14, on=(val>>b)&1;
+    c.fillStyle="#0a1c24"; c.fillRect(xx,y,10,18);
+    c.strokeStyle="#1c4a5e"; c.strokeRect(xx+.5,y+.5,9,17);
+    c.fillStyle=on?"#7fe3ff":"#2a4b58"; c.fillRect(xx+2,on?y+2:y+10,6,6);
+    PANEL_HIT.push({x:xx-2,y:y-2,w:14,h:22,fn:()=>flip(b)});
+  }
+}
+
+function paintPanel(){
+  const c=pnlX, W=512, H=400;
+  c.setTransform(VID.crt,0,0,VID.crt,0,0);
+  PANEL_HIT.length=0;
+  bezel(c,W,H);
+  c.fillStyle="#071018"; c.fillRect(10,10,W-20,H-24);
+  const dim="#2a7d99", bright="#5ad7ff";
+  c.font="9px ui-monospace,monospace";
+  c.fillStyle=bright;
+  c.fillText("SUPERVISOR MCU \u00b7 "+WORDBITS+"-bit \u00b7 host-emulated (not NANDs) \u00b7 shares machine RAM",16,24);
+
+  // cpu registers
+  c.fillStyle=dim; c.fillText("PC",16,46);
+  pledRow(c,52,38,16,CPU.pc,null);
+  c.fillStyle=bright; c.fillText(hex4(CPU.pc),52+16*14+10,46);
+  c.fillStyle=dim; c.fillText("A",16,64);
+  pledRow(c,52,56,WORDBITS,CPU.a,null);
+  c.fillStyle=bright; c.fillText(hexw(CPU.a),52+WORDBITS*14+10,64);
+  c.fillStyle=dim; c.fillText("X",16,82);
+  pledRow(c,52,74,WORDBITS,CPU.x,null);
+  c.fillStyle=bright; c.fillText(hexw(CPU.x),52+WORDBITS*14+10,82);
+  c.fillStyle=dim;
+  c.fillText("Z="+CPU.z+"  C="+CPU.cf+"   "+(CPU.run?"RUNNING":"HALTED")
+    +"   "+CPU.hz+" ips"+(CPU.brk>=0?"   brk "+hex4(CPU.brk):""),16,100);
+
+  let bx=16, by=110;
+  pbtn(c,bx,by,52,18,"RUN",()=>cpuSetRun(true),CPU.run); bx+=58;
+  pbtn(c,bx,by,52,18,"HALT",()=>cpuSetRun(false),!CPU.run); bx+=58;
+  pbtn(c,bx,by,52,18,"STEP",()=>cpuStepN(1),false); bx+=58;
+  pbtn(c,bx,by,64,18,"JMP\u2192SW",()=>{ CPU.pc=swAddr&0xFFFF; },false); bx+=70;
+  pbtn(c,bx,by,52,18,"RESET",()=>cpuReset(),false); bx+=58;
+  pbtn(c,bx,by,40,18,"ips\u00f72",()=>{ CPU.hz=Math.max(1,CPU.hz/2); },false); bx+=46;
+  pbtn(c,bx,by,40,18,"ips\u00d72",()=>{ CPU.hz=Math.min(2e6,CPU.hz*2); },false);
+
+  c.fillStyle="#12303c"; c.fillRect(16,138,W-32,1);
+
+  // memory: latch LEDs, address switches, live data LEDs, data switches
+  c.fillStyle=dim; c.fillText("LATCH",16,160);
+  pledRow(c,90,152,16,latch,null);
+  c.fillStyle=bright; c.fillText(hex4(latch),90+16*14+10,160);
+  c.fillStyle=dim; c.fillText("A\u00b7SW",16,184);
+  pswRow(c,90,174,16,swAddr,b=>{ swAddr^=(1<<b); });
+  c.fillStyle=bright; c.fillText(hex4(swAddr),90+16*14+10,184);
+  c.fillStyle=dim; c.fillText("MEM",16,212);
+  pledRow(c,90,204,WORDBITS,MEM[latch]||0,b=>{ MEM[latch]^=(1<<b); });
+  c.fillStyle=bright; c.fillText(hexw(MEM[latch]||0),90+WORDBITS*14+10,212);
+  c.fillStyle=dim; c.fillText("\u2190 click bit = flip RAM",90+WORDBITS*14+50,212);
+  c.fillStyle=dim; c.fillText("D\u00b7SW",16,236);
+  pswRow(c,90,226,WORDBITS,swData,b=>{ swData^=(1<<b); });
+  c.fillStyle=bright; c.fillText(hexw(swData&WMASK),90+WORDBITS*14+10,236);
+
+  bx=90; by=252;
+  pbtn(c,bx,by,58,18,"EXAM",()=>{ latch=swAddr&0xFFFF; },false); bx+=64;
+  pbtn(c,bx,by,58,18,"EXAM+",()=>{ latch=(latch+1)&0xFFFF; },false); bx+=64;
+  pbtn(c,bx,by,58,18,"DEP",()=>{ MEM[latch]=swData&WMASK; },false); bx+=64;
+  pbtn(c,bx,by,58,18,"DEP+",()=>{ latch=(latch+1)&0xFFFF; MEM[latch]=swData&WMASK; },false);
+
+  c.fillStyle="#12303c"; c.fillRect(16,282,W-32,1);
+
+  // ram window around the latch
+  c.fillStyle=dim; c.fillText("ram @ latch",16,302);
+  let xx=90;
+  const st=(latch-4)&0xFFFF, wid=(WORDBITS===8)?22:36;
+  for(let k=0;k<9;k++){
+    const a=(st+k)&0xFFFF;
+    c.fillStyle=(a===latch)?bright:dim;
+    c.fillText(hexw(MEM[a]),xx,302);
+    xx+=wid;
+  }
+
+  c.fillStyle=dim;
+  c.fillText("keys here: r run \u00b7 h halt \u00b7 s step \u00b7 j jmp\u2192sw \u00b7 esc back \u00b7 arrows hit machine hooks",16,330);
+  c.fillText("terminal twins: .asm/.end \u00b7 .cpu \u00b7 .d/.e/.bit \u2014 raw HATTAR lines always work too",16,344);
+  c.fillText("mcu IN reads keys: bit0 \u2191 1 \u2193 2 \u2190 3 \u2192 4 spc 5 z 6 x",16,358);
+
+  tubeLabel(c,W,H,"PNL-0 \u00b7 front panel \u00b7 supervisor mcu","#5ad7ff");
+  scanlines(c,W,H);
+}
+
+/* raycaster ----------------------------------------------------------------- */
+function render3D(){
+  const W=RW, H=RH;
+  // ceiling / floor
+  let g=ctx.createLinearGradient(0,0,0,H/2);
+  g.addColorStop(0,"#10131a"); g.addColorStop(1,"#04060a");
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,H/2);
+  g=ctx.createLinearGradient(0,H/2,0,H);
+  g.addColorStop(0,"#070503"); g.addColorStop(1,"#1a140c");
+  ctx.fillStyle=g; ctx.fillRect(0,H/2,W,H/2);
+
+  aim=0; aimDist=99;
+  for(let x=0;x<W;x++){
+    const camX=2*x/W-1;
+    const rdx=dirX+plX*camX, rdy=dirY+plY*camX;
+    let mapX=px|0, mapY=py|0;
+    const ddx=rdx===0?1e30:Math.abs(1/rdx);
+    const ddy=rdy===0?1e30:Math.abs(1/rdy);
+    let stepX,stepY,sdx,sdy;
+    if(rdx<0){ stepX=-1; sdx=(px-mapX)*ddx; } else { stepX=1; sdx=(mapX+1-px)*ddx; }
+    if(rdy<0){ stepY=-1; sdy=(py-mapY)*ddy; } else { stepY=1; sdy=(mapY+1-py)*ddy; }
+    let side=0, cell=0, guard=0;
+    while(guard++<64){
+      if(sdx<sdy){ sdx+=ddx; mapX+=stepX; side=0; }
+      else{ sdy+=ddy; mapY+=stepY; side=1; }
+      cell=(MAP[mapY]&&MAP[mapY][mapX])||((mapX<0||mapX>=MAPW||mapY<0||mapY>=MAPH)?1:0);
+      if(cell>0) break;
+    }
+    const perp=side===0?sdx-ddx:sdy-ddy;
+    const h=Math.min(H*8, H/Math.max(perp,0.05));
+    const ds=H/2-h/2;
+
+    if(x===(W>>1)){ aim=cell; aimDist=perp; }
+
+    if(cell>=2){
+      let wallX=side===0? py+perp*rdy : px+perp*rdx;
+      wallX-=Math.floor(wallX);
+      const tex=cell===2?termC:cell===3?scrC:pnlC;
+      let tx=(wallX*tex.width)|0;
+      if((side===0&&rdx>0)||(side===1&&rdy<0)) tx=tex.width-1-tx;
+      ctx.drawImage(tex,tx,0,1,tex.height,x,ds,1,h);
+      const fog=Math.min(0.55,perp/14);
+      if(fog>0.02){ ctx.fillStyle="rgba(4,8,6,"+fog+")"; ctx.fillRect(x,ds,1,h); }
+    } else {
+      const base=side===0?52:40;
+      const f=Math.max(0.12,1-perp/9);
+      ctx.fillStyle="rgb("+((base+8)*f|0)+","+((base+4)*f|0)+","+((base-4)*f|0)+")";
+      ctx.fillRect(x,ds,1,h);
+      // faint mortar lines on the concrete
+      if(((side===0?py+perp*rdy:px+perp*rdx)*8|0)%8===0){
+        ctx.fillStyle="rgba(0,0,0,0.25)"; ctx.fillRect(x,ds,1,h);
+      }
+    }
+  }
+}
+
+function drawHUD(now){
+  const W=RW, H=RH, u=Math.max(1,RW/480);
+  const f1=Math.round(11*u);
+  // minimap
+  const mc=5*u, mx=W-MAPW*mc-8*u, my=8*u;
+  ctx.fillStyle="rgba(4,6,5,0.7)"; ctx.fillRect(mx-3*u,my-3*u,MAPW*mc+6*u,MAPH*mc+6*u);
+  for(let y=0;y<MAPH;y++)for(let x=0;x<MAPW;x++){
+    const c=MAP[y][x];
+    if(!c) continue;
+    ctx.fillStyle=c===2?"#49f07d":c===3?"#ffb648":c===4?"#5ad7ff":"#2c2c30";
+    ctx.fillRect(mx+x*mc,my+y*mc,mc-u,mc-u);
+  }
+  ctx.fillStyle="#e8f5ea";
+  ctx.fillRect(mx+px*mc-u,my+py*mc-u,3*u,3*u);
+  ctx.strokeStyle="#e8f5ea"; ctx.lineWidth=Math.max(1,u*0.8); ctx.beginPath();
+  ctx.moveTo(mx+px*mc,my+py*mc); ctx.lineTo(mx+(px+dirX)*mc,my+(py+dirY)*mc); ctx.stroke();
+
+  // crosshair + prompt
+  const near=aim>=2 && aimDist<2.1;
+  const col=aim===2?"#49f07d":aim===3?"#ffb648":"#5ad7ff";
+  ctx.fillStyle=near?col:"rgba(220,230,220,0.5)";
+  ctx.fillRect(W/2-u,H/2-u,3*u,3*u);
+  ctx.font=f1+"px ui-monospace,monospace"; ctx.textAlign="center";
+  if(near){
+    const lbl=aim===2?"[\u23ce] HATTAR TTY":aim===3?"[\u23ce] inspect CRT":"[\u23ce] front panel";
+    ctx.fillText(lbl,W/2,H/2-14*u);
+  }
+  // status bar
+  ctx.textAlign="left";
+  ctx.fillStyle="rgba(4,7,5,0.75)"; ctx.fillRect(0,H-16*u,W,16*u);
+  ctx.fillStyle="#2b8f4e";
+  ctx.fillText("hp "+hp+" \u00b7 "+nn+" gates \u00b7 "+hz+" Hz"
+    +(CPU.run?" \u00b7 mcu":"")+(paused?" \u00b7 paused":""),6*u,H-5*u);
+  ctx.fillStyle="#3d5a45"; ctx.textAlign="right";
+  ctx.fillText("wasd walk \u00b7 q/e turn \u00b7 \u23ce use \u00b7 \u2190\u2191\u2193\u2192 machine",W-6*u,H-5*u);
+  ctx.textAlign="left";
+}
+
+let OV={ox:0,oy:0,k:1};       // last overlay transform, for panel clicks
+function drawOverlay(now){
+  const W=RW, H=RH, u=Math.max(1,RW/480);
+  ctx.fillStyle="rgba(2,4,3,0.8)"; ctx.fillRect(0,0,W,H);
+  const src=mode==="tty"?termC:mode==="crt"?scrC:pnlC;
+  const s=Math.min((W-24*u)/src.width,(H-34*u)/src.height);
+  const dw=src.width*s, dh=src.height*s;
+  const ox=(W-dw)/2, oy=(H-dh)/2-6*u;
+  ctx.imageSmoothingEnabled=true;      // tube is denser than dest: smooth it
+  ctx.drawImage(src,ox,oy,dw,dh);
+  ctx.imageSmoothingEnabled=false;
+  OV={ox,oy,k:dw/src._lw};
+  ctx.font=Math.round(10*u)+"px ui-monospace,monospace"; ctx.textAlign="center";
+  ctx.fillStyle=mode==="tty"?"#2b8f4e":mode==="crt"?"#b57a24":"#2a7d99";
+  ctx.fillText(mode==="tty"
+    ?"type hattar or .commands \u00b7 paste to load \u00b7 arrows still drive the machine \u00b7 esc back"
+    :mode==="crt"
+    ?"arrows/space/z/x drive the machine \u00b7 esc steps back"
+    :"click switches, buttons, and memory bits \u00b7 r/h/s/j \u00b7 esc back",
+    W/2,H-6*u);
+  ctx.textAlign="left";
+}
+
+/* input ---------------------------------------------------------------------- */
+const walk={w:0,a:0,s:0,d:0,q:0,e:0};
+const PCMAP={ArrowUp:"up",ArrowDown:"down",ArrowLeft:"left",ArrowRight:"right",
+             " ":"space",z:"z",x:"x"};
+
+function pcKey(name,down,repeat){
+  for(let k=0;k<keyb.length;k++){
+    if(keyb[k].name!==name) continue;
+    if(keyb[k].toggle){ if(down&&!repeat) KV[k+1]^=1; }
+    else KV[k+1]=down?1:0;
+  }
+}
+
+function interact(){
+  if(aimDist<2.1){
+    if(aim===2) mode="tty";
+    else if(aim===3) mode="crt";
+    else if(aim===4) mode="pnl";
+  }
+  if(mode!=="walk" && document.exitPointerLock) document.exitPointerLock();
+  syncMobile();
+}
+
+addEventListener("keydown",e=>{
+  const ae=document.activeElement;
+  if(ae && (ae.id==="src"||ae.id==="mline")) return;
+  const pc=PCMAP[e.key];
+
+  if(mode==="tty"){
+    if(e.key==="Escape"){ mode="walk"; syncMobile(); e.preventDefault(); return; }
+    if(pc && e.key.indexOf("Arrow")===0){ pcKey(pc,true,e.repeat); e.preventDefault(); return; }
+    if(e.key==="Enter"){
+      if(tin.trim().length||asmBuf) execLine(tin);
+      tin=""; e.preventDefault(); return;
+    }
+    if(e.key==="Backspace"){ tin=tin.slice(0,-1); e.preventDefault(); return; }
+    if(e.key.length===1 && !e.ctrlKey && !e.metaKey && !e.altKey){ tin+=e.key; e.preventDefault(); }
+    return;
+  }
+  if(mode==="crt"){
+    if(e.key==="Escape"||e.key==="Enter"){ mode="walk"; syncMobile(); e.preventDefault(); return; }
+    if(pc){ pcKey(pc,true,e.repeat); e.preventDefault(); }
+    return;
+  }
+  if(mode==="pnl"){
+    if(e.key==="Escape"){ mode="walk"; syncMobile(); e.preventDefault(); return; }
+    if(pc){ pcKey(pc,true,e.repeat); e.preventDefault(); return; }
+    const k=e.key.toLowerCase();
+    if(k==="r") cpuSetRun(true);
+    else if(k==="h") cpuSetRun(false);
+    else if(k==="s") cpuStepN(1);
+    else if(k==="j"){ CPU.pc=swAddr&0xFFFF; tdim("  [mcu] pc="+hex4(CPU.pc)); }
+    return;
+  }
+  // walk
+  if(pc){ pcKey(pc,true,e.repeat); e.preventDefault(); return; }
+  const k=e.key.toLowerCase();
+  if(k in walk){ walk[k]=1; e.preventDefault(); }
+  else if(e.key==="Enter"){ interact(); e.preventDefault(); }
+});
+
+addEventListener("keyup",e=>{
+  const pc=PCMAP[e.key];
+  if(pc) pcKey(pc,false,false);
+  const k=e.key.toLowerCase();
+  if(k in walk) walk[k]=0;
+});
+
+/* paste straight into the TTY: multi-line pastes exec line by line, which is
+   how you load .asm listings or whole machine patches without the loader */
+addEventListener("paste",e=>{
+  if(mode!=="tty") return;
+  const txt=(e.clipboardData?e.clipboardData.getData("text"):"")||"";
+  if(!txt) return;
+  e.preventDefault();
+  const lines=txt.split(/\r?\n/);
+  if(lines.length===1){ tin+=lines[0]; return; }
+  if(tin.trim().length){ execLine(tin); tin=""; }
+  for(const L of lines) if(L.trim().length||asmBuf) execLine(L);
+});
+
+/* panel clicks: undo the overlay transform, then hit-test the widgets */
+function panelClick(clientX,clientY){
+  const r=cvs.getBoundingClientRect();
+  const cx=(clientX-r.left)*RW/r.width;
+  const cy=(clientY-r.top)*RH/r.height;
+  const lx=(cx-OV.ox)/OV.k, ly=(cy-OV.oy)/OV.k;
+  for(const h of PANEL_HIT){
+    if(lx>=h.x && lx<h.x+h.w && ly>=h.y && ly<h.y+h.h){ h.fn(); return true; }
+  }
+  return false;
+}
+
+cvs.addEventListener("click",e=>{
+  if(mode==="pnl"){ panelClick(e.clientX,e.clientY); return; }
+  if(mode==="walk" && !isTouch && document.pointerLockElement!==cvs && cvs.requestPointerLock)
+    cvs.requestPointerLock();
+});
+
+addEventListener("mousemove",e=>{
+  if(document.pointerLockElement===cvs && mode==="walk") rotate(e.movementX*0.0022);
+});
+
+/* movement ------------------------------------------------------------------ */
+function rotate(a){
+  const c=Math.cos(a), s=Math.sin(a);
+  let nx=dirX*c-dirY*s; dirY=dirX*s+dirY*c; dirX=nx;
+  nx=plX*c-plY*s; plY=plX*s+plY*c; plX=nx;
+}
+function solid(x,y){
+  const row=MAP[y|0];
+  const c=row?row[x|0]:undefined;
+  return c===undefined?1:c;
+}
+function move(dt){
+  if(mode!=="walk") return;
+  const sp=2.7*dt, rs=2.3*dt, r=0.22;
+  if(walk.q) rotate(-rs);
+  if(walk.e) rotate(rs);
+  let vx=0, vy=0;
+  if(walk.w){ vx+=dirX; vy+=dirY; }
+  if(walk.s){ vx-=dirX; vy-=dirY; }
+  if(walk.a){ vx+=dirY; vy-=dirX; }
+  if(walk.d){ vx-=dirY; vy+=dirX; }
+  vx+=tvx; vy+=tvy;
+  const m=Math.hypot(vx,vy);
+  if(m>0.01){
+    vx=vx/m*sp; vy=vy/m*sp;
+    if(!solid(px+vx+Math.sign(vx)*r, py)) px+=vx;
+    if(!solid(px, py+vy+Math.sign(vy)*r)) py+=vy;
+  }
+}
+
+/* touch: left half = stick, right half = look, taps = use / panel click ------ */
+const isTouch=("ontouchstart" in window);
+let tvx=0, tvy=0;
+let stickId=-1, stickX0=0, stickY0=0;
+let lookId=-1, lookX0=0;
+let tapT=0, tapX=0, tapY=0;
+
+cvs.addEventListener("touchstart",e=>{
+  for(const t of e.changedTouches){
+    if(t.clientX<innerWidth/2 && stickId<0){
+      stickId=t.identifier; stickX0=t.clientX; stickY0=t.clientY;
+    } else if(lookId<0){
+      lookId=t.identifier; lookX0=t.clientX;
+    }
+    tapT=performance.now(); tapX=t.clientX; tapY=t.clientY;
+  }
+  e.preventDefault();
+},{passive:false});
+
+cvs.addEventListener("touchmove",e=>{
+  for(const t of e.changedTouches){
+    if(t.identifier===stickId){
+      const dx=(t.clientX-stickX0)/60, dy=(t.clientY-stickY0)/60;
+      const f=Math.max(-1,Math.min(1,-dy)), s=Math.max(-1,Math.min(1,dx));
+      tvx=dirX*f-dirY*s; tvy=dirY*f+dirX*s;
+    } else if(t.identifier===lookId){
+      if(mode==="walk") rotate((t.clientX-lookX0)*0.006);
+      lookX0=t.clientX;
+    }
+  }
+  e.preventDefault();
+},{passive:false});
+
+function touchDone(e){
+  for(const t of e.changedTouches){
+    const wasTap=(performance.now()-tapT<250 &&
+                  Math.hypot(t.clientX-tapX,t.clientY-tapY)<12);
+    if(t.identifier===stickId){ stickId=-1; tvx=0; tvy=0; }
+    if(t.identifier===lookId) lookId=-1;
+    if(wasTap && e.type==="touchend"){
+      if(mode==="walk") interact();
+      else if(mode==="pnl"){
+        if(!panelClick(t.clientX,t.clientY)){ mode="walk"; syncMobile(); }
+      }
+      else { mode="walk"; syncMobile(); }
+    }
+  }
+  e.preventDefault();
+}
+cvs.addEventListener("touchend",touchDone,{passive:false});
+cvs.addEventListener("touchcancel",touchDone,{passive:false});
+
+/* mobile DOM ----------------------------------------------------------------- */
+const mrow=document.getElementById("mrow");
+const mact=document.getElementById("mact");
+const mline=document.getElementById("mline");
+function syncMobile(){
+  mrow.classList.toggle("open", isTouch && mode==="tty");
+  if(isTouch && mode==="tty") mline.focus(); else mline.blur();
+}
+document.getElementById("mesc").addEventListener("click",()=>{ mode="walk"; syncMobile(); });
+mline.addEventListener("keydown",e=>{
+  if(e.key==="Enter"){
+    const v=mline.value;
+    if(v.trim().length||asmBuf) execLine(v);
+    mline.value="";
+    e.preventDefault();
+  }
+});
+for(const b of mrow.querySelectorAll("[data-pc]")){
+  const name=b.dataset.pc;
+  b.addEventListener("pointerdown",e=>{ pcKey(name,true,false); e.preventDefault(); });
+  b.addEventListener("pointerup",()=>pcKey(name,false,false));
+  b.addEventListener("pointercancel",()=>pcKey(name,false,false));
+}
+mact.addEventListener("click",()=>interact());
+
+/* loader ---------------------------------------------------------------------
+   boot is warm: it swaps the machine and nothing else. */
+const loader=document.getElementById("loader");
+const srcTa=document.getElementById("src");
+function openLoader(){
+  srcTa.value=lastSrc;
+  loader.classList.add("open");
+  srcTa.focus();
+}
+document.getElementById("loadbtn").addEventListener("click",openLoader);
+document.getElementById("cancel").addEventListener("click",()=>loader.classList.remove("open"));
+document.getElementById("boot").addEventListener("click",()=>{
+  loader.classList.remove("open");
+  bootMachine(srcTa.value);
+});
+
+/* boot ----------------------------------------------------------------------- */
+tprint("HATTAR-PC :: machine room");
+tdim("three consoles: TTY (green) \u00b7 CRT (amber) \u00b7 front PANEL (cyan)");
+tdim("walk up + \u23ce to use one \u00b7 type .help in the TTY");
+bootDemo(8);
+
+/* frame loop ------------------------------------------------------------------ */
+let last=performance.now(), fracc=0;
+function frame(now){
+  const dt=Math.min(0.1,(now-last)/1000); last=now;
+
+  if(!paused){
+    fracc+=dt*hz;
+    let n=Math.floor(fracc); fracc-=n;
+    if(n>0) ticks(Math.min(n,250000));
+  }
+  if(CPU.run && !paused){
+    CPU.acc+=dt*CPU.hz;
+    let n=Math.floor(CPU.acc); CPU.acc-=n;
+    if(n>0) cpuFrame(Math.min(n,50000));
+  }
+
+  move(dt);
+  paintTerm(now);
+  paintScreen();
+  paintPanel();
+  render3D();
+  if(mode==="walk"){
+    drawHUD(now);
+    mact.classList.toggle("open", isTouch && aim>=2 && aimDist<2.1);
+  } else {
+    drawOverlay(now);
+    mact.classList.remove("open");
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
